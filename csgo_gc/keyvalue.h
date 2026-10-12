@@ -40,6 +40,8 @@ public:
 
     bool ParseFromFile(const char *path);
     bool WriteToFile(const char *path);
+    void Merge(const KeyValue &other);
+    KeyValue *FindOrCreateSubkey(std::string_view name);
 
     void BinaryWriteToString(std::string &buffer);
 
@@ -89,7 +91,6 @@ public:
 
 private:
     bool Parse(KeyValueParser &parser, std::string_view path);
-    KeyValue *FindOrCreateSubkey(std::string_view name);
     void WriteToFile(FILE *f, int indent);
 
     std::string m_name;

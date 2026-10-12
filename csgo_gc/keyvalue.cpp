@@ -358,6 +358,20 @@ KeyValue *KeyValue::FindOrCreateSubkey(std::string_view name)
     return &m_subkeys.emplace_back(name);
 }
 
+void KeyValue::Merge(const KeyValue &other)
+{
+    if (!other.m_string.empty())
+    {
+        m_string = other.m_string;
+    }
+
+    for (const KeyValue &otherSubkey : other.m_subkeys)
+    {
+        KeyValue *existing = FindOrCreateSubkey(otherSubkey.m_name);
+        existing->Merge(otherSubkey);
+    }
+}
+
 static void WriteString(FILE *f, std::string_view value)
 {
     fputc('"', f);

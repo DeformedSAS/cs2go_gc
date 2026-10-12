@@ -11,7 +11,7 @@
 #include "base_gcmessages.pb.h"
 #include "cstrike15_gcmessages.pb.h"
 
-constexpr const char *InventoryFilePath = "csgo_gc/inventory.txt";
+constexpr const char *InventoryFilePath = "cs2go/gc/inventory.txt";
 
 // mikkotodo actual versioning
 constexpr uint64_t InventoryVersion = 7523377975160828514;

@@ -52,8 +52,8 @@ function(launcher_target NAME DEDICATED)
     endif()
 endfunction()
 
-launcher_target(csgo OFF)
+launcher_target(cs2go OFF)
 
 if (WIN32 OR (IS_32BIT AND NOT APPLE))
-    launcher_target(srcds ON)
+    launcher_target(cs2go_srcds ON)
 endif()

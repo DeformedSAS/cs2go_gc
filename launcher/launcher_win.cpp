@@ -123,8 +123,44 @@ static void *LoadModuleAndFindSymbol(const wchar_t *abosoluteModulePath, const c
     return function;
 }
 
+static std::string g_CustomCmdLineA;
+
+typedef LPSTR(WINAPI *GetCommandLineA_t)();
+
+static LPSTR WINAPI HookedGetCommandLineA()
+{
+    return const_cast<LPSTR>(g_CustomCmdLineA.c_str());
+}
+
+static void DetourGetCommandLineA() // deformedsas: took a while but it works, it launches cs2go directly.
+{
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hKernel32)
+        return;
+
+    GetCommandLineA_t pOriginalGetCommandLineA = (GetCommandLineA_t)GetProcAddress(hKernel32, "GetCommandLineA");
+    if (!pOriginalGetCommandLineA)
+        return;
+
+    g_CustomCmdLineA = pOriginalGetCommandLineA();
+    g_CustomCmdLineA += " -game cs2go/csgo -language cs2go_ru -steam"; // add _ru for russian. make sure to change launcher_target to cs2go_rus or something else while compiling in cmakelists.txt
+
+    BYTE *pTarget = (BYTE *)pOriginalGetCommandLineA;
+
+    DWORD dwOldProtect;
+    if (VirtualProtect(pTarget, 5, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+    {
+        DWORD relOffset = (DWORD)HookedGetCommandLineA - (DWORD)pTarget - 5;
+        pTarget[0] = 0xE9; // jmp opcode
+        *(DWORD *)(pTarget + 1) = relOffset;
+        VirtualProtect(pTarget, 5, dwOldProtect, &dwOldProtect);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
 {
+    DetourGetCommandLineA();
+
     wchar_t baseDir[MAX_PATH];
     wchar_t modulePath[MAX_PATH];
 

@@ -144,10 +144,29 @@ Rarity LootListItem::CaseRarity() const
 ItemSchema::ItemSchema()
 {
     KeyValue itemSchema{ "root" };
-    if (!itemSchema.ParseFromFile("csgo/scripts/items/items_game.txt"))
+    if (!itemSchema.ParseFromFile("cs2go/csgo/scripts/items/items_game.txt"))
     {
         assert(false);
         return;
+    }
+
+    // to load other items_game stuff
+    const char *extraFiles[] = {
+        "cs2go/csgo/scripts/items/cs2go.txt",
+        "cs2go/csgo/scripts/items/pro.txt"
+    };
+
+    for (const char *filePath : extraFiles)
+    {
+        KeyValue extraSchema{ "root" };
+        if (extraSchema.ParseFromFile(filePath))
+        {
+            if (const KeyValue *extraItemsGame = extraSchema.GetSubkey("items_game"))
+            {   // then merge them into memory
+                KeyValue *itemsGameNode = itemSchema.FindOrCreateSubkey("items_game");
+                itemsGameNode->Merge(*extraItemsGame);
+            }
+        }
     }
 
     const KeyValue *itemsGame = itemSchema.GetSubkey("items_game");
@@ -198,7 +217,7 @@ ItemSchema::ItemSchema()
     {
         KeyValue unusualLootLists{ "unusual_loot_lists" };
 
-        if (unusualLootLists.ParseFromFile("csgo_gc/unusual_loot_lists.txt"))
+        if (unusualLootLists.ParseFromFile("cs2go/gc/unusual_loot_lists.txt"))
         {
             ParseLootLists(&unusualLootLists, true);
         }
