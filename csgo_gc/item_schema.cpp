@@ -153,7 +153,10 @@ ItemSchema::ItemSchema()
     // to load other items_game stuff
     const char *extraFiles[] = {
         "cs2go/csgo/scripts/items/cs2go.txt",
-        "cs2go/csgo/scripts/items/pro.txt"
+        "cs2go/csgo/scripts/items/pro.txt",
+        "cs2go/csgo/scripts/items/cs2/cs2.txt",
+        "cs2go/csgo/scripts/items/cs2/majors.txt",
+        "cs2go/csgo/scripts/items/cs2/skins.txt"
     };
 
     for (const char *filePath : extraFiles)
