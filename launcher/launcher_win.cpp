@@ -143,7 +143,7 @@ static void DetourGetCommandLineA() // deformedsas: took a while but it works, i
         return;
 
     g_CustomCmdLineA = pOriginalGetCommandLineA();
-    g_CustomCmdLineA += " -game cs2go/csgo -language cs2go_ru -steam"; // add _ru for russian. make sure to change launcher_target to cs2go_rus or something else while compiling in cmakelists.txt
+    g_CustomCmdLineA += " -game cs2go/csgo -language cs2go -steam"; // add _ru for russian. make sure to change launcher_target to cs2go_rus or something else while compiling in cmakelists.txt
 
     BYTE *pTarget = (BYTE *)pOriginalGetCommandLineA;
 
