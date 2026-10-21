@@ -34,24 +34,17 @@ static void ErrorMessageBox(const char *format, ...)
 
 #if defined(__APPLE__)
     CFStringRef messageString = CFStringCreateWithCString(kCFAllocatorDefault, message, kCFStringEncodingUTF8);
-
     CFOptionFlags responseFlags;
 
-    CFUserNotificationDisplayAlert(0, // timeout
-        kCFUserNotificationStopAlertLevel, // docs: "The notification is very serious."
-        nullptr, // iconURL
-        nullptr, // soundURL
-        nullptr, // localizationURL
-        CFSTR("csgo_gc"), // alertHeader
-        messageString, // alertMessage
-        nullptr, // defaultButtonTitle
-        nullptr, // alternateButtonTitle
-        nullptr, // otherButtonTitle
-        &responseFlags); // not used but idk if it can be null
+    CFUserNotificationDisplayAlert(0,
+        kCFUserNotificationStopAlertLevel,
+        nullptr, nullptr, nullptr,
+        CFSTR("csgo_gc"),
+        messageString,
+        nullptr, nullptr, nullptr,
+        &responseFlags);
 
     CFRelease(messageString);
-#else
-    fprintf(stderr, "csgo_gc: %s\n", message);
 #endif
 }
 
@@ -76,11 +69,41 @@ static void *LoadModuleAndFindSymbol(const char *modulePath, const char *symbol)
 
 int main(int argc, char **argv)
 {
+    // Define the custom arguments you want to add
+    const char *extraArgs[] = {
+        "-game", "cs2go/csgo",
+        "-language", "cs2go",
+        "-steam"
+    };
+    int extraCount = sizeof(extraArgs) / sizeof(extraArgs[0]);
+
+    // Allocate a new argv array: original argc + extra arguments + 1 for nullptr terminator
+    int newArgc = argc + extraCount;
+    char **newArgv = (char **)malloc((newArgc + 1) * sizeof(char *));
+    if (!newArgv)
+    {
+        ErrorMessageBox("Failed to allocate memory for command-line arguments.");
+        return 1;
+    }
+
+    // Copy original arguments
+    for (int i = 0; i < argc; i++)
+    {
+        newArgv[i] = argv[i];
+    }
+
+    // Append your custom mod arguments
+    for (int i = 0; i < extraCount; i++)
+    {
+        newArgv[argc + i] = (char *)extraArgs[i];
+    }
+    newArgv[newArgc] = nullptr;
+
     const char *modulePath = "bin/" GC_LIB_DIR "/" LAUNCHER_LIB GC_LIB_SUFFIX GC_LIB_EXTENSION;
     LauncherMain_t LauncherMain = (LauncherMain_t)LoadModuleAndFindSymbol(modulePath, SYMBOL_NAME);
     if (!LauncherMain)
     {
-        // LoadModuleAndFindSymbol told us why
+        free(newArgv);
         return 1;
     }
 
@@ -90,5 +113,8 @@ int main(int argc, char **argv)
     InstallGC(false);
 #endif
 
-    return LauncherMain(argc, argv);
+    int result = LauncherMain(newArgc, newArgv);
+
+    free(newArgv);
+    return result;
 }
