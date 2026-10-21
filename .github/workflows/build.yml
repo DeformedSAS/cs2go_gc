@@ -52,14 +52,14 @@ jobs:
       run: |
         mkdir ${{ github.workspace }}/release
         cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -S ${{ github.workspace }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DOUTDIR=${{ github.workspace }}/release -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-linux
-        cmake --build ${{ github.workspace }}/build --config ${{ matrix.build_type }} --target cs2go cs2go_srcds
+        cmake --build ${{ github.workspace }}/build --config ${{ matrix.build_type }} --target cs2go
 
     - if: matrix.os == 'macos-15'
       name: Build macOS
       run: |
         mkdir ${{ github.workspace }}/release
         cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -S ${{ github.workspace }} -DCMAKE_OSX_ARCHITECTURES=x86_64 -DFUNCHOOK_CPU=x86 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DOUTDIR=${{ github.workspace }}/release -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-osx
-        cmake --build ${{ github.workspace }}/build --config ${{ matrix.build_type }} --target cs2go cs2go_srcds
+        cmake --build ${{ github.workspace }}/build --config ${{ matrix.build_type }} --target cs2go cs2go
 
     - if: matrix.os == 'windows-latest'
       name: Build Windows
