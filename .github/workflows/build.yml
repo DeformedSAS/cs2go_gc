@@ -43,29 +43,16 @@ jobs:
       with:
         path: |
           ${{ github.workspace }}/build/vcpkg_installed
-          ${{ github.workspace }}/build_ds/vcpkg_installed
         key: vcpkg-${{ matrix.os }}-${{ steps.vcpkg-commit.outputs.sha }}-${{ hashFiles('vcpkg.json') }}
         restore-keys: |
           vcpkg-${{ matrix.os }}-${{ steps.vcpkg-commit.outputs.sha }}-
 
     - if: matrix.os == 'ubuntu-latest'
-      name: Dependencies
-      run: |
-        sudo dpkg --add-architecture i386
-        sudo apt-get update
-        sudo apt install --yes --no-install-recommends gcc-multilib g++-multilib
-
-    - if: matrix.os == 'ubuntu-latest'
       name: Build Linux
       run: |
         mkdir ${{ github.workspace }}/release
-        # 64-bit build
         cmake -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -S ${{ github.workspace }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DOUTDIR=${{ github.workspace }}/release -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-linux
         cmake --build ${{ github.workspace }}/build --config ${{ matrix.build_type }} --target cs2go cs2go_srcds
-        
-        # 32-bit (Dedicated Server / ds) build
-        cmake -B ${{ github.workspace }}/build_ds -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -S ${{ github.workspace }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_ASM_FLAGS=-m32 -DOUTDIR=${{ github.workspace }}/release -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x86-linux
-        cmake --build ${{ github.workspace }}/build_ds --config ${{ matrix.build_type }} --target cs2go_srcds
 
     - if: matrix.os == 'macos-15'
       name: Build macOS
@@ -96,7 +83,7 @@ jobs:
         cp $GITHUB_WORKSPACE/examples/unusual_loot_lists.txt $GITHUB_WORKSPACE/release/cs2go_gc/
 
         case "${{ matrix.os }}" in
-          ubuntu-latest)  TRIPLET=x86-linux ;;
+          ubuntu-latest)  TRIPLET=x64-linux ;;
           macos-15)       TRIPLET=x64-osx ;;
           windows-latest) TRIPLET=x86-windows-static ;;
         esac
