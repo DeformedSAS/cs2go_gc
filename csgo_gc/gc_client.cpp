@@ -681,7 +681,7 @@ void ClientGC::StoreGetUserData(GCMessageRead &messageRead)
 
     std::string binaryString;
     binaryString.reserve(1 << 17);
-    priceSheetRead.Root().BinaryWriteToString(binaryString);
+    priceSheet.Root().BinaryWriteToString(binaryString);
 
     // fuck you idiot
     CMsgStoreGetUserDataResponse response;
