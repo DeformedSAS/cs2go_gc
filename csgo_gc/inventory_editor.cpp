@@ -18,7 +18,7 @@ enum CmdType : uint32_t
     // bidirectional
     CmdItemCreate, // item payload
     CmdItemModify, // item payload
-    CmdItemDestroy, // high id only
+    CmdItemDestroy, // low id only
 
     // sent as a response to CmdItemCreate by the GC
     // so the inventory editor can set the correct id
@@ -29,7 +29,7 @@ enum CmdType : uint32_t
 
 static void ParseItem(MessageRead &message, EditorItem &item, ItemSchema &itemSchema)
 {
-    item.highId = message.ReadUint32();
+    item.lowId = message.ReadUint32();
 
     item.desc.inventory = message.ReadUint32();
     item.desc.defIndex = ToEnum<ItemDefIndex>(message.ReadUint32());
@@ -87,7 +87,7 @@ static void ParseItem(MessageRead &message, EditorItem &item, ItemSchema &itemSc
 
 static void SerializeItem(MessageWrite &message, const EditorItem &item)
 {
-    message.WriteUint32(item.highId);
+    message.WriteUint32(item.lowId);
 
     message.WriteUint32(item.desc.inventory);
     message.WriteUint32(FromEnum(item.desc.defIndex));
@@ -130,7 +130,7 @@ static void SerializeItem(MessageWrite &message, const EditorItem &item)
 InventoryEditor::InventoryEditor(ItemSchema &itemSchema)
     : m_itemSchema{ itemSchema }
 {
-    const std::string &origin = GetConfig().InventoryEditorOrigin();
+    const std::string &origin = GetConfig().m_inventoryEditorOrigin;
     if (origin.empty() || origin == "null")
     {
         Platform::Print("Inventory editor server disabled\n");
@@ -147,7 +147,7 @@ InventoryEditor::InventoryEditor(ItemSchema &itemSchema)
 
     // FIXME: should actually be a member...
     static lws_protocols protocols[] = {
-        { "default", callback, sizeof(Session), RxBufferSize },
+        { "default", callback, sizeof(Session), RxBufferSize, 0, nullptr, 0 },
         LWS_PROTOCOL_LIST_TERM
     };
 
@@ -256,7 +256,7 @@ bool InventoryEditor::ParseMessage(const Message &message, EditorChanges &change
         case CmdItemDestroy:
             item.emplace();
             item->type = EditorItemChangeType::Destroyed;
-            item->highId = read.ReadUint32();
+            item->lowId = read.ReadUint32();
             break;
 
         default:
@@ -309,7 +309,7 @@ bool InventoryEditor::SerializeMessage(const EditorChanges &changes, Message &me
 
         case EditorItemChangeType::Destroyed:
             write.WriteUint32(CmdItemDestroy);
-            write.WriteUint32(item.highId);
+            write.WriteUint32(item.lowId);
             break;
 
         default:
@@ -322,7 +322,7 @@ bool InventoryEditor::SerializeMessage(const EditorChanges &changes, Message &me
     return true;
 }
 
-void InventoryEditor::SendItemId(uint32_t requestId, uint32_t highId)
+void InventoryEditor::SendItemId(uint32_t requestId, uint32_t lowId)
 {
     if (!m_client)
     {
@@ -334,7 +334,7 @@ void InventoryEditor::SendItemId(uint32_t requestId, uint32_t highId)
     MessageWrite message;
     message.WriteUint32(CmdItemSetId);
     message.WriteUint32(requestId);
-    message.WriteUint32(highId);
+    message.WriteUint32(lowId);
 
     m_outbox.push_back(std::move(message).TakeBuffer());
     lws_callback_on_writable(m_client);
@@ -349,7 +349,7 @@ int InventoryEditor::Callback(lws *wsi, int reason, void *user, void *in, size_t
     case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
     {
         // validate the origin here
-        const std::string &expected = GetConfig().InventoryEditorOrigin();
+        const std::string &expected = GetConfig().m_inventoryEditorOrigin;
         int length = lws_hdr_total_length(wsi, WSI_TOKEN_ORIGIN);
         if (length <= 0 || static_cast<size_t>(length) != expected.size())
         {

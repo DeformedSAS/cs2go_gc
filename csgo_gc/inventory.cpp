@@ -13,28 +13,15 @@
 
 constexpr const char *InventoryFilePath = "cs2go/gc/inventory.txt";
 
-// mikkotodo actual versioning
-constexpr uint64_t InventoryVersion = 7523377975160828514;
-
-// if the high item id is higher than this, it'll get interpreted as a default item fake id
-constexpr uint32_t MaxHighItemId = static_cast<uint32_t>((ItemIdDefaultItemMask >> 32) - 1);
-
 // mikkotodo move
 constexpr uint32_t SlotUneqip = 0xffff;
-
-// mix the account id into item ids to avoid collisions in multiplayer games
-inline uint64_t ComposeItemId(uint32_t accountId, uint32_t highItemId)
-{
-    uint64_t low = accountId;
-    uint64_t high = highItemId;
-    return low | (high << 32);
-}
 
 // get the full item id of the casket item is in
 static uint64_t GetCasketId(const Item &item)
 {
+    uint64_t low = item.GetAttributeValue<uint32_t>(AttributeDefIndex::CasketIdLow);
     uint64_t high = item.GetAttributeValue<uint32_t>(AttributeDefIndex::CasketIdHigh);
-    return high ? ((high << 32) | item.GetAttributeValue<uint32_t>(AttributeDefIndex::CasketIdLow)) : 0;
+    return low ? ((high << 32) | low) : 0;
 }
 
 // helper, see ItemIdDefaultItemMask for more information
@@ -90,14 +77,14 @@ bool Inventory::Update(InventoryChangeMessages &changeMessages)
 
     // FIXME: this will cause the changes to be sent back to the editor!!! ideally we would not do this,
     // but we have cases like removal of caskets or casketed items that will cause more item modifications
-    InventoryModify modify{ *this };
+    InventoryModify modify;
 
     // not const ref since we move the item descs
     for (EditorItem &editorItem : changes.items)
     {
         if (editorItem.type == EditorItemChangeType::Destroyed)
         {
-            Item *item = FindItem(ComposeItemId(AccountId(), editorItem.highId));
+            Item *item = FindItem(ComposeItemId(AccountId(), editorItem.lowId));
             if (item)
             {
                 DestroyItem(modify, item);
@@ -112,16 +99,16 @@ bool Inventory::Update(InventoryChangeMessages &changeMessages)
 
         if (editorItem.type == EditorItemChangeType::Created)
         {
-            // editorItem.highId is NOT the item id we should use!!!!
+            // editorItem.lowId is NOT the item id we should use!!!!
             // it's an opaque "item request id" from the editor, we
             // need to send the actual item id back now that we've determined it
             Item &item = CreateItem(modify, std::move(editorItem.desc));
-            m_editor.SendItemId(editorItem.highId, item.HighId());
+            m_editor.SendItemId(editorItem.lowId, item.LowId());
             continue;
         }
 
         // modification
-        Item *item = FindItem(ComposeItemId(AccountId(), editorItem.highId));
+        Item *item = FindItem(ComposeItemId(AccountId(), editorItem.lowId));
         if (!item)
         {
             assert(false);
@@ -131,21 +118,8 @@ bool Inventory::Update(InventoryChangeMessages &changeMessages)
         modify.UpdateFromDesc(*item, std::move(editorItem.desc));
     }
 
-    changeMessages = BuildChangeMessages(modify);
+    changeMessages = FinishChanges(modify);
     return true;
-}
-
-void Inventory::FlushChanges(const InventoryModify &modify)
-{
-    if (modify.m_itemChanges.empty() && modify.m_defaultEquipChanges.empty())
-    {
-        // nope
-        return;
-    }
-
-    SendChangesToEditor(modify);
-
-    WriteToFile();
 }
 
 void Inventory::SendFullInventoryToEditor()
@@ -164,10 +138,10 @@ void Inventory::SendFullInventoryToEditor()
 
         EditorItem &item = changes.items.emplace_back();
         item.type = EditorItemChangeType::Created;
-        item.highId = pair.second.HighId();
+        item.lowId = pair.second.LowId();
         item.desc = pair.second.GetDesc();
 
-        m_editorVisibleItems.insert(item.highId);
+        m_editorVisibleItems.insert(item.lowId);
     }
 
     m_editor.SendChanges(changes, true);
@@ -177,25 +151,25 @@ void Inventory::SendChangesToEditor(const InventoryModify &modify)
 {
     EditorChanges changes;
 
-    for (const auto &[highId, change] : modify.m_itemChanges)
+    for (const auto &[lowId, change] : modify.m_itemChanges)
     {
-        const Item *source = FindItem(ComposeItemId(AccountId(), highId));
+        const Item *source = FindItem(ComposeItemId(AccountId(), lowId));
         if (!source || GetCasketId(*source))
         {
-            if (m_editorVisibleItems.erase(highId))
+            if (m_editorVisibleItems.erase(lowId))
             {
                 EditorItem &dest = changes.items.emplace_back();
-                dest.highId = highId;
+                dest.lowId = lowId;
                 dest.type = EditorItemChangeType::Destroyed;
             }
 
             continue;
         }
 
-        bool inserted = m_editorVisibleItems.insert(highId).second;
+        bool inserted = m_editorVisibleItems.insert(lowId).second;
 
         EditorItem &dest = changes.items.emplace_back();
-        dest.highId = highId;
+        dest.lowId = lowId;
         dest.type = inserted ? EditorItemChangeType::Created : EditorItemChangeType::Modified;
         dest.desc = source->GetDesc();
     }
@@ -203,27 +177,64 @@ void Inventory::SendChangesToEditor(const InventoryModify &modify)
     m_editor.SendChanges(changes, false);
 }
 
-InventoryChangeMessages Inventory::BuildChangeMessages(
-    const InventoryModify &modify,
+InventoryChangeMessages Inventory::FinishChanges(
+    InventoryModify &modify,
     std::optional<EGCItemCustomizationNotification> customizationType,
     std::initializer_list<uint64_t> customizationItemIds)
 {
     InventoryChangeMessages messages;
 
-    for (auto [highId, change] : modify.m_itemChanges)
+    if (modify.HasChanges())
     {
-        uint64_t itemId = ComposeItemId(AccountId(), highId);
+        m_version++;
+    }
 
-        if (change.type == ItemChangeType::Destroyed)
+    BuildSOCacheMessages(modify, m_clientCache, messages.client, false);
+    BuildSOCacheMessages(modify, m_gameServerCache, messages.gameServer, true);
+
+    if (customizationType.has_value())
+    {
+        messages.notification.mutable_item_id()->Assign(customizationItemIds.begin(), customizationItemIds.end());
+        messages.notification.set_request(*customizationType);
+    }
+
+    if (modify.HasChanges())
+    {
+        SendChangesToEditor(modify);
+        WriteToFile();
+    }
+
+    assert(!modify.m_finished);
+    modify.m_finished = true;
+
+    return messages;
+}
+
+void Inventory::BuildSOCacheMessages(
+    const InventoryModify &modify,
+    SOCacheState &state,
+    SOCacheMessages &messages,
+    bool server)
+{
+    if (!state.subscribed)
+    {
+        return;
+    }
+
+    for (auto [lowId, change] : modify.m_itemChanges)
+    {
+        uint64_t itemId = ComposeItemId(AccountId(), lowId);
+
+        if (change == ItemChangeType::Destroyed)
         {
             assert(!FindItem(itemId));
+            if (state.items.erase(itemId))
+            {
+                CSOEconItem econItem;
+                econItem.set_id(itemId);
+                ToSingleObject(messages.destroyed.emplace_back(), SOTypeItem, econItem);
+            }
 
-            CSOEconItem econItem;
-            econItem.set_id(itemId);
-
-            SingleObject &object = messages.destroyed.emplace_back();
-            object.sendToGameServer = change.gameServerDirty;
-            ToSingleObject(object.proto, SOTypeItem, econItem);
             continue;
         }
 
@@ -234,23 +245,22 @@ InventoryChangeMessages Inventory::BuildChangeMessages(
             continue;
         }
 
-        CSOEconItem econItem;
-        item->ToCSOEconItem(econItem, AccountId());
-
-        if (change.type == ItemChangeType::Created)
+        // keep items in the server socache even if they get unequipped later
+        if (server && !item->HasEquips() && !state.items.contains(itemId))
         {
-            SingleObject &object = messages.created.emplace_back();
-            object.sendToGameServer = change.gameServerDirty;
-            ToSingleObject(object.proto, SOTypeItem, econItem);
+            continue;
+        }
+
+        CSOEconItem econItem;
+        item->ToCSOEconItem(econItem, AccountId(), m_itemSchema, m_oldProtocol);
+
+        if (state.items.insert(itemId).second)
+        {
+            ToSingleObject(messages.created.emplace_back(), SOTypeItem, econItem);
         }
         else
         {
-            AddToMultipleObjects(messages.updatedClient, SOTypeItem, econItem);
-
-            if (change.gameServerDirty)
-            {
-                AddToMultipleObjects(messages.updatedGameServer, SOTypeItem, econItem);
-            }
+            AddToMultipleObjects(messages.updated, SOTypeItem, econItem);
         }
     }
 
@@ -258,17 +268,10 @@ InventoryChangeMessages Inventory::BuildChangeMessages(
     {
         CSOEconDefaultEquippedDefinitionInstanceClient proto;
         DefaultEquipToProto(proto, defaultEquip, AccountId());
-        AddToMultipleObjects(messages.updatedClient, SOTypeDefaultEquippedDefinitionInstanceClient, proto);
-        AddToMultipleObjects(messages.updatedGameServer, SOTypeDefaultEquippedDefinitionInstanceClient, proto);
-    }
 
-    if (customizationType.has_value())
-    {
-        messages.notification.mutable_item_id()->Assign(customizationItemIds.begin(), customizationItemIds.end());
-        messages.notification.set_request(*customizationType);
+        // always create these, not sure if strictly needed for old builds but no harm in doing it
+        ToSingleObject(messages.created.emplace_back(), SOTypeDefaultEquippedDefinitionInstanceClient, proto);
     }
-
-    return messages;
 }
 
 void Inventory::AddToMultipleObjects(CMsgSOMultipleObjects &message, SOTypeId type, const google::protobuf::MessageLite &object)
@@ -276,7 +279,8 @@ void Inventory::AddToMultipleObjects(CMsgSOMultipleObjects &message, SOTypeId ty
     if (!message.has_version())
     {
         assert(!message.has_owner_soid());
-        message.set_version(InventoryVersion);
+        message.set_owner(m_steamId); // for old builds
+        message.set_version(m_version);
         message.mutable_owner_soid()->set_type(SoIdTypeSteamId);
         message.mutable_owner_soid()->set_id(m_steamId);
     }
@@ -297,7 +301,8 @@ void Inventory::ToSingleObject(CMsgSOSingleObject &message, SOTypeId type, const
     assert(!message.has_type_id());
     assert(!message.has_object_data());
 
-    message.set_version(InventoryVersion);
+    message.set_owner(m_steamId); // for old builds
+    message.set_version(m_version);
     message.mutable_owner_soid()->set_type(SoIdTypeSteamId);
     message.mutable_owner_soid()->set_id(m_steamId);
 
@@ -310,100 +315,100 @@ uint32_t Inventory::AccountId() const
     return m_steamId & 0xffffffff;
 }
 
-uint32_t Inventory::GetHighItemId(uint32_t highItemId)
+uint32_t Inventory::GetLowItemId(uint32_t lowItemId)
 {
     // Players fuck up their inventory files constantly and end up with item id collisions...
     // This doesn't return until the item id is unique for this session, try with the provided
     // item id first, if it's invalid or already in use increment it
 
-    if (!highItemId)
+    if (!lowItemId)
     {
-        m_lastHighItemId++;
-        highItemId = m_lastHighItemId;
+        m_lastLowItemId++;
+        lowItemId = m_lastLowItemId;
     }
 
-    for (;; highItemId++)
+    for (;; lowItemId++)
     {
-        if (highItemId > MaxHighItemId)
+        if (!lowItemId)
         {
-            // would be interpreted as a default item (it's not)
             // item ids should be strictly monotonically increasing, but
             // if the situation gets this cooked then we need to reset
-            m_lastHighItemId = 1;
-            highItemId = m_lastHighItemId;
+            m_lastLowItemId = 1;
+            lowItemId = m_lastLowItemId;
         }
 
-        if (m_items.count(ComposeItemId(AccountId(), highItemId)))
+        if (m_items.count(ComposeItemId(AccountId(), lowItemId)))
         {
             // item id collision
-            assert(false);
             continue;
         }
 
-        if (highItemId > m_lastHighItemId)
+        if (lowItemId > m_lastLowItemId)
         {
-            m_lastHighItemId = highItemId;
+            m_lastLowItemId = lowItemId;
         }
 
         // ok
-        return highItemId;
+        return lowItemId;
     }
 }
 
-void Inventory::CreateItem(uint32_t highId, const KeyValue &kv)
+void Inventory::CreateItem(uint32_t lowId, const KeyValue &kv)
 {
-    highId = GetHighItemId(highId);
-    uint64_t itemId = ComposeItemId(AccountId(), highId);
+    lowId = GetLowItemId(lowId);
+    uint64_t itemId = ComposeItemId(AccountId(), lowId);
 
-    // this will succeed, GetHighItemId confirmed there are no collisions
-    auto [it, inserted] = m_items.try_emplace(itemId, highId, AccountId(), kv, m_itemSchema);
+    // this will succeed, GetLowItemId confirmed there are no collisions
+    [[maybe_unused]] auto [it, inserted] = m_items.try_emplace(itemId, lowId, AccountId(), kv, m_itemSchema);
     assert(inserted);
 }
 
 Item &Inventory::CreateItem(InventoryModify &modify, ItemDesc &&desc)
 {
-    uint32_t highId = GetHighItemId(0);
-    uint64_t itemId = ComposeItemId(AccountId(), highId);
+    uint32_t lowId = GetLowItemId(0);
+    uint64_t itemId = ComposeItemId(AccountId(), lowId);
 
-    // this will succeed, GetHighItemId confirmed there are no collisions
-    auto [it, inserted] = m_items.try_emplace(itemId, highId, std::move(desc));
+    // this will succeed, GetLowItemId confirmed there are no collisions
+    auto [it, inserted] = m_items.try_emplace(itemId, lowId, std::move(desc));
     assert(inserted);
 
-    modify.MarkItemCreated(highId, it->second.HasEquips());
+    modify.MarkItemCreated(lowId);
 
     // new item: if a cached icon exists, it's because
     // of item id reuse and the icon is likely wrong
-    RemoveCachedIcon(highId);
+    RemoveCachedIcon(lowId);
 
     return it->second;
 }
 
 void Inventory::ReadFromFile()
 {
-    KeyValue inventoryKey{ "inventory" };
-    if (!inventoryKey.ParseFromFile(InventoryFilePath))
+    KeyValueRead inventoryRead{ InventoryFilePath };
+    if (!inventoryRead.Good())
     {
         return;
     }
 
+    const KeyValue &inventoryKey = inventoryRead.Root();
+
     const KeyValue *itemsKey = inventoryKey.GetSubkey("items");
     if (itemsKey)
     {
-        m_items.reserve(itemsKey->SubkeyCount());
+        m_items.reserve(itemsKey->Subkeys().size());
 
-        for (const KeyValue &itemKey : *itemsKey)
+        for (const KeyValue &itemKey : itemsKey->Subkeys())
         {
-            uint32_t highItemId = FromString<uint32_t>(itemKey.Name());
-            CreateItem(highItemId, itemKey);
+            uint32_t lowItemId = FromString<uint32_t>(itemKey.Name());
+            CreateItem(lowItemId, itemKey);
         }
     }
 
     const KeyValue *defaultEquipsKey = inventoryKey.GetSubkey("default_equips");
     if (defaultEquipsKey)
     {
-        m_defaultEquips.reserve(defaultEquipsKey->SubkeyCount());
+        m_defaultEquips.reserve(defaultEquipsKey->Subkeys().size());
 
-        for (const KeyValue &defaultEquipKey : *defaultEquipsKey)
+        for (const KeyValue &defaultEquipKey : defaultEquipsKey->Subkeys())
         {
             uint32_t defIndex = FromString<uint32_t>(defaultEquipKey.Name());
             uint32_t classId = defaultEquipKey.GetNumber<uint32_t>("class_id");
@@ -420,36 +425,69 @@ void Inventory::WriteToFile() const
         m_items.size(),
         m_defaultEquips.size());
 
-    KeyValue inventoryKey{ "inventory" };
-
+    FILE *f = fopen(InventoryFilePath, "wb");
+    if (!f)
     {
-        KeyValue &itemsKey = inventoryKey.AddSubkey("items");
+        Platform::Print("Could not open {} for writing\n", InventoryFilePath);
+        return;
+    }
+
+    KeyValueWrite write{ f };
+
+    if (!m_items.empty())
+    {
+        write.BeginBlock("items");
 
         for (const auto &pair : m_items)
         {
-            const Item &item = pair.second;
-            KeyValue &itemKey = itemsKey.AddSubkey(std::to_string(item.HighId()));
-            item.ToKeyValue(itemKey);
+            write.BeginBlock(std::to_string(pair.second.LowId()));
+            pair.second.ToKeyValue(write);
+            write.EndBlock();
         }
+
+        write.EndBlock();
     }
 
+    if (!m_defaultEquips.empty())
     {
-        KeyValue &defaultEquipsKey = inventoryKey.AddSubkey("default_equips");
+        write.BeginBlock("default_equips");
 
         for (const DefaultEquip &defaultEquip : m_defaultEquips)
         {
-            KeyValue &defaultEquipKey = defaultEquipsKey.AddSubkey(std::to_string(defaultEquip.defIndex));
-            defaultEquipKey.AddNumber("class_id", defaultEquip.classId);
-            defaultEquipKey.AddNumber("slot_id", defaultEquip.slotId);
+            write.BeginBlock(std::to_string(defaultEquip.defIndex));
+            write.AddNumber("class_id", defaultEquip.classId);
+            write.AddNumber("slot_id", defaultEquip.slotId);
+            write.EndBlock();
         }
+
+        write.EndBlock();
     }
 
-    inventoryKey.WriteToFile(InventoryFilePath);
+    bool writeFailed = ferror(f) != 0;
+    int closeError = (fclose(f) == EOF) ? errno : 0;
+
+    if (writeFailed)
+    {
+        Platform::Print("Writing {} failed\n", InventoryFilePath);
+    }
+
+    if (closeError != 0)
+    {
+        Platform::Print("Closing {} failed: {} ({})\n",
+            InventoryFilePath,
+            strerror(closeError),
+            closeError);
+    }
 }
 
 void Inventory::BuildCacheSubscription(CMsgSOCacheSubscribed &message, int level, bool server)
 {
-    message.set_version(InventoryVersion);
+    SOCacheState &state = server ? m_gameServerCache : m_clientCache;
+    state.subscribed = true;
+    state.items.clear();
+
+    message.set_owner(m_steamId); // for old builds
+    message.set_version(m_version);
     message.mutable_owner_soid()->set_type(SoIdTypeSteamId);
     message.mutable_owner_soid()->set_id(m_steamId);
 
@@ -465,8 +503,9 @@ void Inventory::BuildCacheSubscription(CMsgSOCacheSubscribed &message, int level
             }
 
             CSOEconItem serialized;
-            pair.second.ToCSOEconItem(serialized, AccountId());
+            pair.second.ToCSOEconItem(serialized, AccountId(), m_itemSchema, m_oldProtocol);
             serialized.SerializeToString(object->add_object_data());
+            state.items.insert(pair.first);
         }
     }
 
@@ -511,14 +550,14 @@ void Inventory::BuildCacheSubscription(CMsgSOCacheSubscribed &message, int level
 // also i think this is the way valve gc does it???? can't remember
 InventoryChangeMessages Inventory::EquipItem(uint64_t itemId, uint32_t classId, uint32_t slotId)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     if (!EquipItem(modify, itemId, classId, slotId))
     {
         assert(false);
         return {};
     }
 
-    return BuildChangeMessages(modify);
+    return FinishChanges(modify);
 }
 
 bool Inventory::EquipItem(InventoryModify &modify, uint64_t itemId, uint32_t classId, uint32_t slotId)
@@ -573,19 +612,19 @@ bool Inventory::EquipItem(InventoryModify &modify, uint64_t itemId, uint32_t cla
 
 InventoryChangeMessages Inventory::RemoveItem(uint64_t itemId)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     if (!DestroyItemById(modify, itemId))
     {
         assert(false);
         return {};
     }
 
-    return BuildChangeMessages(modify);
+    return FinishChanges(modify);
 }
 
 InventoryChangeMessages Inventory::UseItem(uint64_t itemId)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item *item = FindItem(itemId);
     if (!item)
     {
@@ -614,7 +653,7 @@ InventoryChangeMessages Inventory::UseItem(uint64_t itemId)
     // remove this to have unlimited sprays
     modify.SetItemAttribute(unsealed, AttributeDefIndex::SpraysRemaining, 50u);
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_GraffitiUnseal, { unsealedId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_GraffitiUnseal, { unsealedId });
 }
 
 InventoryChangeMessages Inventory::UnlockCrate(uint64_t crateId, uint64_t keyId)
@@ -627,7 +666,7 @@ InventoryChangeMessages Inventory::UnlockCrate(uint64_t crateId, uint64_t keyId)
     }
 
     // CASE OPENING
-    CaseOpening caseOpening{ m_itemSchema, m_random };
+    CaseOpening caseOpening{ m_itemSchema };
 
     ItemDesc temp;
     if (!caseOpening.SelectItemFromCrate(crate->DefIndex(), temp))
@@ -636,18 +675,18 @@ InventoryChangeMessages Inventory::UnlockCrate(uint64_t crateId, uint64_t keyId)
         return {};
     }
 
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item &item = CreateItem(modify, std::move(temp));
     uint64_t itemId = item.FullIdFor(AccountId());
 
-    if (GetConfig().DestroyUsedItems())
+    if (GetConfig().m_destroyUsedItems)
     {
         assert(keyId != itemId);
         DestroyItem(modify, crate);
         DestroyItemById(modify, keyId);
     }
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_UnlockCrate, { itemId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_UnlockCrate, { itemId });
 }
 
 InventoryChangeMessages Inventory::SetItemPositions(
@@ -656,27 +695,30 @@ InventoryChangeMessages Inventory::SetItemPositions(
 {
     for (const CMsgSetItemPositions_ItemPosition &position : message.item_positions())
     {
-        if (!FindItem(position.item_id()))
+        assert(position.item_id() || position.legacy_item_id());
+        uint64_t itemId = position.has_item_id() ? position.item_id() : ComposeItemId(AccountId(), position.legacy_item_id());
+        if (!FindItem(itemId))
         {
             assert(false);
             return {};
         }
     }
 
-    InventoryModify modify{ *this };
+    InventoryModify modify;
 
     for (const CMsgSetItemPositions_ItemPosition &position : message.item_positions())
     {
-        Item *item = FindItem(position.item_id());
-
-        Platform::Print("SetItemPositions: {} --> {}\n", position.item_id(), position.position());
-        modify.SetItemInventory(*item, position.position());
+        uint64_t itemId = position.has_item_id() ? position.item_id() : ComposeItemId(AccountId(), position.legacy_item_id());
+        Item *item = FindItem(itemId);
 
         CMsgItemAcknowledged &acknowledgement = acknowledgements.emplace_back();
         item->ToEconItemPreviewDataBlock(*acknowledgement.mutable_iteminfo(), AccountId());
+
+        Platform::Print("SetItemPositions: {} --> {}\n", itemId, position.position());
+        modify.SetItemInventory(*item, position.position());
     }
 
-    return BuildChangeMessages(modify);
+    return FinishChanges(modify);
 }
 
 static AttributeDefIndex StickerAttributeForSlot(AttributeDefIndex defIndex, uint32_t slot)
@@ -688,7 +730,7 @@ static AttributeDefIndex StickerAttributeForSlot(AttributeDefIndex defIndex, uin
 
 InventoryChangeMessages Inventory::ApplySticker(const CMsgApplySticker &message)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
 
     assert(message.has_sticker_item_id());
     assert(message.has_sticker_slot());
@@ -747,12 +789,12 @@ InventoryChangeMessages Inventory::ApplySticker(const CMsgApplySticker &message)
 
     uint64_t itemId = item->FullIdFor(AccountId());
 
-    if (GetConfig().DestroyUsedItems())
+    if (GetConfig().m_destroyUsedItems)
     {
         DestroyItem(modify, sticker);
     }
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_ApplySticker, { itemId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_ApplySticker, { itemId });
 }
 
 static void RemoveStickerAttributes(InventoryModify &modify, Item &item, uint32_t slot)
@@ -765,7 +807,7 @@ static void RemoveStickerAttributes(InventoryModify &modify, Item &item, uint32_
 
 InventoryChangeMessages Inventory::ScrapeSticker(const CMsgApplySticker &message)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item *item = FindItem(message.item_item_id());
     if (!item)
     {
@@ -794,16 +836,16 @@ InventoryChangeMessages Inventory::ScrapeSticker(const CMsgApplySticker &message
             // this was a default weapon clone with a sticker so destroy the entire item
             uint64_t fakeItemId = static_cast<uint64_t>(item->DefIndex()) | ItemIdDefaultItemMask;
             DestroyItem(modify, item);
-            return BuildChangeMessages(modify, request, { fakeItemId });
+            return FinishChanges(modify, request, { fakeItemId });
         }
 
         // remove the sticker
         RemoveStickerAttributes(modify, *item, message.sticker_slot());
 
-        return BuildChangeMessages(modify, request, { item->FullIdFor(AccountId()) });
+        return FinishChanges(modify, request, { item->FullIdFor(AccountId()) });
     }
 
-    return BuildChangeMessages(modify);
+    return FinishChanges(modify);
 }
 
 InventoryChangeMessages Inventory::IncrementKillCountAttribute(uint64_t itemId, uint32_t amount)
@@ -815,14 +857,14 @@ InventoryChangeMessages Inventory::IncrementKillCountAttribute(uint64_t itemId, 
         return {};
     }
 
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     modify.IncrementItemAttribute(*item, AttributeDefIndex::KillEater, static_cast<int>(amount));
-    return BuildChangeMessages(modify);
+    return FinishChanges(modify);
 }
 
 InventoryChangeMessages Inventory::NameItem(uint64_t nameTagId, uint64_t itemId, std::string_view name)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item *item = FindItem(itemId);
     if (!item)
     {
@@ -844,18 +886,18 @@ InventoryChangeMessages Inventory::NameItem(uint64_t nameTagId, uint64_t itemId,
         modify.SetItemAttribute(*item, AttributeDefIndex::CasketModificationDate, modifyTime);
     }
 
-    if (GetConfig().DestroyUsedItems())
+    if (GetConfig().m_destroyUsedItems)
     {
         assert(nameTagId != itemId);
         DestroyItemById(modify, nameTagId);
     }
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_NameItem, { itemId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_NameItem, { itemId });
 }
 
 InventoryChangeMessages Inventory::NameBaseItem(uint64_t nameTagId, uint32_t defIndex, std::string_view name)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
 
     ItemDesc desc{};
     m_itemSchema.GetItemDesc(ToEnum<ItemDefIndex>(defIndex), ItemOriginBaseItem, UnacknowledgedInvalid, desc);
@@ -865,19 +907,19 @@ InventoryChangeMessages Inventory::NameBaseItem(uint64_t nameTagId, uint32_t def
 
     modify.SetItemAttribute(item, AttributeDefIndex::CustomName, std::string{ name });
 
-    if (GetConfig().DestroyUsedItems())
+    if (GetConfig().m_destroyUsedItems)
     {
         assert(nameTagId != itemId);
         DestroyItemById(modify, nameTagId);
     }
 
     // mikkotodo def index???
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_NameBaseItem, { itemId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_NameBaseItem, { itemId });
 }
 
 InventoryChangeMessages Inventory::RemoveItemName(uint64_t itemId)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item *item = FindItem(itemId);
     if (!item)
     {
@@ -889,12 +931,12 @@ InventoryChangeMessages Inventory::RemoveItemName(uint64_t itemId)
     {
         uint64_t fakeItemId = static_cast<uint64_t>(item->DefIndex()) | ItemIdDefaultItemMask;
         DestroyItem(modify, item);
-        return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_RemoveItemName, { fakeItemId });
+        return FinishChanges(modify, k_EGCItemCustomizationNotification_RemoveItemName, { fakeItemId });
     }
 
     modify.RemoveItemAttributes(*item, { AttributeDefIndex::CustomName });
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_RemoveItemName, { item->FullIdFor(AccountId()) });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_RemoveItemName, { item->FullIdFor(AccountId()) });
 }
 
 Item *Inventory::FindItem(uint64_t itemId)
@@ -921,7 +963,7 @@ static void EmbedStorageReference(InventoryModify &modify, Item &item, uint64_t 
 
 InventoryChangeMessages Inventory::CasketItemAdd(uint64_t casketId, uint64_t itemId)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item *storage = FindItem(casketId);
     if (!storage)
     {
@@ -945,7 +987,7 @@ InventoryChangeMessages Inventory::CasketItemAdd(uint64_t casketId, uint64_t ite
     auto result = modify.IncrementItemAttribute(*storage, AttributeDefIndex::CasketItemsCount, 1, 1000);
     if (result == AttributeIncrement::OutOfRange)
     {
-        return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_CasketTooFull, { casketId });
+        return FinishChanges(modify, k_EGCItemCustomizationNotification_CasketTooFull, { casketId });
     }
 
     if (result != AttributeIncrement::Ok)
@@ -959,12 +1001,12 @@ InventoryChangeMessages Inventory::CasketItemAdd(uint64_t casketId, uint64_t ite
 
     EmbedStorageReference(modify, *target, casketId);
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_CasketAdded, { casketId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_CasketAdded, { casketId });
 }
 
 InventoryChangeMessages Inventory::CasketItemExtract(uint64_t casketId, uint64_t itemId)
 {
-    InventoryModify modify{ *this };
+    InventoryModify modify;
     Item *storage = FindItem(casketId);
     if (!storage)
     {
@@ -997,7 +1039,134 @@ InventoryChangeMessages Inventory::CasketItemExtract(uint64_t casketId, uint64_t
 
     modify.RemoveItemAttributes(*target, { AttributeDefIndex::CasketIdLow, AttributeDefIndex::CasketIdHigh });
 
-    return BuildChangeMessages(modify, k_EGCItemCustomizationNotification_CasketRemoved, { casketId });
+    return FinishChanges(modify, k_EGCItemCustomizationNotification_CasketRemoved, { casketId });
+}
+
+constexpr size_t CraftInputItemCount = 10;
+
+// get the item set the item belongs to
+static const ItemSet *GetItemSet(const Item &item, const ItemSchema &itemSchema)
+{
+    uint32_t paintKit = static_cast<uint32_t>(item.GetAttributeValue<float>(AttributeDefIndex::TexturePrefab));
+    assert(paintKit); // FIXME: allow unpainted? why not
+    return itemSchema.ItemSetFromItemAndKit(item.DefIndex(), paintKit);
+}
+
+static std::span<const LootListItem> RaritySpan(std::span<const LootListItem> items, Rarity rarity)
+{
+    assert(std::is_sorted(items.begin(), items.end(), [](const LootListItem &a, const LootListItem &b)
+        { return a.CaseRarity() < b.CaseRarity(); }));
+
+    auto first = items.begin();
+    while (first->rarity != rarity)
+    {
+        first++;
+    }
+
+    auto last = first + 1;
+    while (last != items.end() && last->rarity == rarity)
+    {
+        last++;
+    }
+
+    return { first, last };
+}
+
+static bool SelectCraftOutputItem(const Item *(&inputItems)[CraftInputItemCount], const ItemSchema &itemSchema, ItemDesc &outputDesc)
+{
+    size_t total = 0;
+    std::span<const LootListItem> lists[CraftInputItemCount];
+
+    // assume that the game validated these...
+    Rarity rarity = ToEnum<Rarity>(FromEnum(inputItems[0]->GetRarity()) + 1u);
+
+    // select the output item by getting all eligible ones, and then picking one
+    for (size_t i = 0; i < CraftInputItemCount; i++)
+    {
+        const ItemSet *set = GetItemSet(*inputItems[i], itemSchema);
+        if (!set)
+        {
+            assert(0);
+            return false;
+        }
+
+        lists[i] = RaritySpan(set->items, rarity);
+        total += lists[i].size();
+    }
+
+    size_t index = Random::Uint32(0, static_cast<uint32_t>(total - 1));
+    const LootListItem *selected = nullptr;
+
+    for (std::span<const LootListItem> list : lists)
+    {
+        if (index < list.size())
+        {
+            selected = &list[index];
+            break;
+        }
+
+        index -= list.size();
+    }
+
+    assert(selected);
+
+    // GetCraftOutput will set the wear as lerp(minWear, maxWear, averageWear)
+    float averageWear = 0.0f;
+
+    for (const Item *item : inputItems)
+    {
+        // don't bother checking if the attribute exists
+        averageWear += item->GetAttributeValue<float>(AttributeDefIndex::TextureWear);
+    }
+
+    averageWear /= CraftInputItemCount;
+
+    bool statTrak = inputItems[0]->HasAttribute(AttributeDefIndex::KillEater);
+
+    return itemSchema.GetCraftOutput(*selected, averageWear, statTrak, outputDesc);
+}
+
+InventoryChangeMessages Inventory::CraftItem(std::span<const uint64_t> inputItemIds, uint64_t &outputItemId)
+{
+    if (inputItemIds.size() != CraftInputItemCount)
+    {
+        assert(0);
+        return {};
+    }
+
+    // just resolve them all...
+    const Item *inputItems[CraftInputItemCount]{};
+    for (size_t i = 0; i < CraftInputItemCount; i++)
+    {
+        inputItems[i] = FindItem(inputItemIds[i]);
+        if (!inputItems[i])
+        {
+            assert(0);
+            return {};
+        }
+    }
+
+    ItemDesc outputDesc;
+    if (!SelectCraftOutputItem(inputItems, m_itemSchema, outputDesc))
+    {
+        assert(0);
+        return {};
+    }
+
+    InventoryModify modify;
+
+    Item &outputItem = CreateItem(modify, std::move(outputDesc));
+    outputItemId = outputItem.FullIdFor(AccountId());
+
+    if (GetConfig().m_destroyUsedItems)
+    {
+        for (uint64_t id : inputItemIds)
+        {
+            DestroyItemById(modify, id);
+        }
+    }
+
+    return FinishChanges(modify);
 }
 
 InventoryChangeMessages Inventory::PurchaseItems(const std::vector<uint32_t> &defIndexes, std::vector<uint64_t> &itemIds)
@@ -1005,17 +1174,44 @@ InventoryChangeMessages Inventory::PurchaseItems(const std::vector<uint32_t> &de
     itemIds.clear();
     itemIds.reserve(defIndexes.size());
 
-    InventoryModify modify{ *this };
+    InventoryModify modify;
 
     for (uint32_t defIndex : defIndexes)
     {
-        ItemDesc desc{};
-        m_itemSchema.GetItemDesc(ToEnum<ItemDefIndex>(defIndex), ItemOriginPurchased, UnacknowledgedPurchased, desc);
-        Item &item = CreateItem(modify, std::move(desc));
-        itemIds.push_back(item.FullIdFor(AccountId()));
+        std::vector<ItemDesc> descs;
+        std::vector<ItemDesc> casketedDescs;
+        m_itemSchema.GetPurchaseItemDescs(ToEnum<ItemDefIndex>(defIndex), descs, casketedDescs);
+
+        // fucked up handling of the rio2022 caskets
+        // FIXME: the tournament event id is missing!!!
+        uint64_t storageId = 0;
+
+        for (ItemDesc &desc : descs)
+        {
+            Item &item = CreateItem(modify, std::move(desc));
+            const uint64_t itemId = item.FullIdFor(AccountId());
+            itemIds.push_back(itemId);
+
+            if (casketedDescs.size())
+            {
+                storageId = itemId;
+
+                modify.SetItemAttribute(item,
+                    AttributeDefIndex::CasketItemsCount,
+                    static_cast<uint32_t>(casketedDescs.size()));
+            }
+        }
+
+        for (ItemDesc &desc : casketedDescs)
+        {
+            // ack them (FIXME: do this properly)
+            desc.inventory = 1;
+            Item &item = CreateItem(modify, std::move(desc));
+            EmbedStorageReference(modify, item, storageId);
+        }
     }
 
-    return BuildChangeMessages(modify);
+    return FinishChanges(modify);
 }
 
 bool Inventory::UnequipItem(InventoryModify &modify, uint64_t itemId)
@@ -1046,25 +1242,16 @@ void Inventory::UnequipItem(InventoryModify &modify, uint32_t classId, uint32_t 
     // check non default items first
     for (auto &pair : m_items)
     {
-        if (modify.RemoveItemEquip(pair.second, classId, slotId))
-        {
-            Platform::Print("Unequip {} class {} slot {}\n", pair.first, classId, slotId);
-        }
+        modify.RemoveItemEquip(pair.second, classId, slotId);
     }
 
     // check default equips, just delete the references locally
-    for (auto it = m_defaultEquips.begin(); it != m_defaultEquips.end();)
+    auto predicate = [classId, slotId](const DefaultEquip &equip)
     {
-        if (it->classId == classId && it->slotId == slotId)
-        {
-            Platform::Print("Unequip {} class {} slot {}\n", it->defIndex, classId, slotId);
-            it = m_defaultEquips.erase(it);
-        }
-        else
-        {
-            it++;
-        }
-    }
+        return equip.classId == classId && equip.slotId == slotId;
+    };
+
+    std::erase_if(m_defaultEquips, predicate);
 }
 
 bool Inventory::DestroyItemById(InventoryModify &modify, uint64_t itemId)
@@ -1097,12 +1284,11 @@ bool Inventory::DestroyItemById(InventoryModify &modify, uint64_t itemId)
         }
     }
 
-    bool hadEquips = item.HasEquips();
     m_items.erase(it);
 
-    RemoveCachedIcon(itemId >> 32);
+    RemoveCachedIcon(static_cast<uint32_t>(itemId));
 
-    modify.MarkItemDestroyed(itemId >> 32, hadEquips);
+    modify.MarkItemDestroyed(static_cast<uint32_t>(itemId));
     return true;
 }
 
@@ -1116,12 +1302,49 @@ void Inventory::DestroyItem(InventoryModify &modify, Item *item)
     }
 }
 
-void Inventory::RemoveCachedIcon(uint32_t highId) const
+static bool RemoveCachedIconVersion(int version, uint32_t highId, uint32_t lowId)
 {
-    // FIXME: first value depends on game version
-    std::string path = std::format("csgo/resource/flash/econ/weapons/cached/13-{:x}-{:x}.iic", highId, AccountId());
-    if (Platform::RemoveFile(path.c_str()))
+    char path[128];
+
+    auto result = std::format_to_n(
+        path,
+        sizeof(path) - 1,
+        "csgo/resource/flash/econ/weapons/cached/{:x}-{:x}-{:x}.iic",
+        version,
+        highId,
+        lowId);
+
+    assert(result.size < sizeof(path));
+    *result.out = '\0';
+
+    if (Platform::RemoveFile(path))
     {
         Platform::Print("Deleted {}\n", path);
+        return true;
+    }
+
+    return false;
+}
+
+void Inventory::RemoveCachedIcon(uint32_t lowId)
+{
+    uint32_t highId = HighItemIdFromAccountId(AccountId());
+
+    if (m_iconCacheVersion >= 0)
+    {
+        RemoveCachedIconVersion(m_iconCacheVersion, highId, lowId);
+        return;
+    }
+
+    constexpr int MinVersion = 0x6;
+    constexpr int MaxVersion = 0x13;
+
+    for (int i = MaxVersion; i >= MinVersion; i--)
+    {
+        if (RemoveCachedIconVersion(i, highId, lowId))
+        {
+            m_iconCacheVersion = i;
+            break;
+        }
     }
 }

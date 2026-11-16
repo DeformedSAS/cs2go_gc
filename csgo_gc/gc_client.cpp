@@ -5,12 +5,17 @@
 #include "graffiti.h"
 #include "inventory_messages.h"
 #include "keyvalue.h"
+#include "networking_shared.h"
+#include "random.h"
 
 #include "base_gcmessages.pb.h"
 #include "cstrike15_gcmessages.pb.h"
 #include "econ_gcmessages.pb.h"
 #include "gcsdk_gcmessages.pb.h"
 #include "gcsystemmsgs.pb.h"
+
+// FIXME: add to protos?
+constexpr int k_EMsgGCRequestInventoryRefresh = 1050;
 
 ClientGC::ClientGC(uint64_t steamId)
     : m_steamId{ steamId }
@@ -30,7 +35,7 @@ ClientGC::~ClientGC()
     Platform::Print("ClientGC destroyed\n");
 }
 
-void ClientGC::HandleEvent(GCEvent type, uint64_t id, const std::vector<uint8_t> &buffer)
+void ClientGC::HandleEvent(GCEvent type, uint64_t id, std::vector<uint8_t> &&buffer)
 {
     switch (type)
     {
@@ -39,11 +44,15 @@ void ClientGC::HandleEvent(GCEvent type, uint64_t id, const std::vector<uint8_t>
         break;
 
     case GCEvent::NetMessage:
-        HandleNetMessage(buffer.data(), static_cast<uint32_t>(buffer.size()));
+        HandleNetMessage(id, buffer.data(), static_cast<uint32_t>(buffer.size()));
         break;
 
-    case GCEvent::SOCacheRequest:
-        HandleSOCacheRequest();
+    case GCEvent::SetAuthTicket:
+        SetAuthTicket(static_cast<uint32_t>(id), std::move(buffer));
+        break;
+
+    case GCEvent::ClearAuthTicket:
+        ClearAuthTicket(static_cast<uint32_t>(id));
         break;
 
     case GCEvent::Tick:
@@ -76,6 +85,14 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
         case k_EMsgGCClientHelloR4:
         case k_EMsgGCClientHelloPartner:
             OnClientHello(messageRead);
+            break;
+
+        case k_EMsgGCCStrike15_v2_MatchmakingClient2GCHello:
+            OnMatchmakingHello();
+            break;
+
+        case k_EMsgGCRequestInventoryRefresh:
+            OnRequestInventoryRefresh();
             break;
 
         case k_EMsgGCAdjustItemEquippedState:
@@ -126,6 +143,14 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
             ProcessCasketItemExtract(messageRead);
             break;
 
+        case k_EMsgGCCStrike15_v2_GetEventFavorites_Request:
+            OnGetEventFavorites(messageRead);
+            break;
+
+        case k_EMsgGCCStrike15_v2_Party_Register:
+            OnPartyRegister(messageRead);
+            break;
+
         default:
             Platform::Print("ClientGC::HandleMessage: unhandled protobuf message {}\n",
                 MessageName(messageRead.TypeUnmasked()));
@@ -136,6 +161,10 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
     {
         switch (messageRead.TypeUnmasked())
         {
+        case k_EMsgGCCraft:
+            CraftItem(messageRead);
+            break;
+
         case k_EMsgGCDelete:
             DeleteItem(messageRead);
             break;
@@ -156,6 +185,10 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
             RemoveItemName(messageRead);
             break;
 
+        case k_EMsgGCStorePurchaseFinalize:
+            StorePurchaseFinalizeStruct(messageRead);
+            break;
+
         default:
             Platform::Print("ClientGC::HandleMessage: unhandled struct message {}\n",
                 MessageName(messageRead.TypeUnmasked()));
@@ -164,13 +197,25 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
     }
 }
 
-void ClientGC::HandleNetMessage(const void *data, uint32_t size)
+void ClientGC::HandleNetMessage(uint64_t steamId, const void *data, uint32_t size)
 {
     // pass 0 as type so it gets parsed from the message
     GCMessageRead messageRead{ 0, data, size };
     if (!messageRead.IsValid())
     {
         assert(false);
+        return;
+    }
+
+    if (!messageRead.IsProtobuf() && messageRead.TypeUnmasked() == k_EMsgNetworkConnect)
+    {
+        HandleConnect(steamId, messageRead);
+        return;
+    }
+
+    if (!m_serverSteamId || steamId != m_serverSteamId)
+    {
+        Platform::Print("ClientGC: ignored message from {} (not our gs {})\n", steamId, m_serverSteamId);
         return;
     }
 
@@ -188,13 +233,73 @@ void ClientGC::HandleNetMessage(const void *data, uint32_t size)
         MessageName(messageRead.TypeUnmasked()));
 }
 
+void ClientGC::SetAuthTicket(uint32_t handle, std::vector<uint8_t> &&buffer)
+{
+    AuthTicket &ticket = m_tickets[handle];
+    ticket.steamId = 0;
+    ticket.buffer = std::move(buffer);
+}
+
+void ClientGC::ClearAuthTicket(uint32_t handle)
+{
+    auto it = m_tickets.find(handle);
+    if (it == m_tickets.end())
+    {
+        assert(false);
+        Platform::Print("ClientGC: tried to clear a nonexistent auth ticket???\n");
+        return;
+    }
+
+    if (it->second.steamId)
+    {
+        Platform::Print("ClientGC: closing p2p session with {}\n", it->second.steamId);
+        PostToHost(HostEvent::CloseChannel, it->second.steamId, {});
+
+        if (it->second.steamId == m_serverSteamId)
+        {
+            Platform::Print("ClientGC: clearing gs identity\n");
+            m_serverSteamId = 0;
+
+            // kind of cringe to store this in inventory...
+            m_inventory.ResetGameServerCache();
+        }
+    }
+
+    m_tickets.erase(it);
+}
+
+void ClientGC::HandleConnect(uint64_t steamId, GCMessageRead &message)
+{
+    uint32_t ticketSize = message.ReadUint32();
+    const void *ticket = message.ReadData(ticketSize);
+    if (!message.IsValid())
+    {
+        Platform::Print("ClientGC: ignored connection from {} (malformed message)\n", steamId);
+        return;
+    }
+
+    for (auto &[handle, authTicket] : m_tickets)
+    {
+        if (authTicket.buffer.size() == ticketSize && !memcmp(authTicket.buffer.data(), ticket, ticketSize))
+        {
+            authTicket.steamId = steamId;
+            m_serverSteamId = steamId;
+            Platform::Print("ClientGC: sending socache to {}\n", steamId);
+            HandleSOCacheRequest();
+            return;
+        }
+    }
+
+    Platform::Print("ClientGC: ignored connection from {} (ticket mismatch)\n", steamId);
+}
+
 void ClientGC::HandleSOCacheRequest()
 {
     CMsgSOCacheSubscribed message;
-    m_inventory.BuildCacheSubscription(message, GetConfig().Level(), true);
+    m_inventory.BuildCacheSubscription(message, GetConfig().m_level, true);
 
     GCMessageWrite messageWrite{ k_ESOMsg_CacheSubscribed, message };
-    PostToHost(HostEvent::NetMessage, 0, std::move(messageWrite).TakeBuffer());
+    PostToHost(HostEvent::NetMessage, m_serverSteamId, std::move(messageWrite).TakeBuffer());
 }
 
 void ClientGC::InventoryUpdate()
@@ -206,44 +311,46 @@ void ClientGC::InventoryUpdate()
     }
 }
 
-void ClientGC::SendMessageToGame(bool sendToGameServer, uint32_t type,
-    const google::protobuf::MessageLite &message, uint64_t jobId)
+void ClientGC::SendMessageToGame(bool server, uint32_t type, const google::protobuf::MessageLite &message, uint64_t jobId)
 {
     GCMessageWrite messageWrite{ type, message, jobId };
 
-    if (sendToGameServer)
+    if (server)
     {
-        PostToHost(HostEvent::NetMessage, 0, messageWrite.CopyBuffer());
+        if (m_serverSteamId)
+        {
+            PostToHost(HostEvent::NetMessage, m_serverSteamId, std::move(messageWrite).TakeBuffer());
+        }
+    }
+    else
+    {
+        uint32_t typeMasked = messageWrite.TypeMasked();
+        PostToHost(HostEvent::Message, typeMasked, std::move(messageWrite).TakeBuffer());
+    }
+}
+
+void ClientGC::SendSOCacheMessages(const SOCacheMessages &messages, bool server)
+{
+    for (const CMsgSOSingleObject &destroyed : messages.destroyed)
+    {
+        SendMessageToGame(server, k_ESOMsg_Destroy, destroyed);
     }
 
-    uint32_t typeMasked = messageWrite.TypeMasked();
-    PostToHost(HostEvent::Message, typeMasked, std::move(messageWrite).TakeBuffer());
+    for (const CMsgSOSingleObject &created : messages.created)
+    {
+        SendMessageToGame(server, k_ESOMsg_Create, created);
+    }
+
+    if (messages.updated.objects_modified_size())
+    {
+        SendMessageToGame(server, k_ESOMsg_UpdateMultiple, messages.updated);
+    }
 }
 
 void ClientGC::SendInventoryChangeMessages(const InventoryChangeMessages &result)
 {
-    for (const SingleObject &destroyed : result.destroyed)
-    {
-        SendMessageToGame(destroyed.sendToGameServer, k_ESOMsg_Destroy, destroyed.proto);
-    }
-
-    for (const SingleObject &created : result.created)
-    {
-        SendMessageToGame(created.sendToGameServer, k_ESOMsg_Create, created.proto);
-    }
-
-    if (result.updatedClient.objects_modified_size())
-    {
-        GCMessageWrite messageWrite{ k_ESOMsg_UpdateMultiple, result.updatedClient };
-        uint32_t typeMasked = messageWrite.TypeMasked();
-        PostToHost(HostEvent::Message, typeMasked, std::move(messageWrite).TakeBuffer());
-    }
-
-    if (result.updatedGameServer.objects_modified_size())
-    {
-        GCMessageWrite messageWrite{ k_ESOMsg_UpdateMultiple, result.updatedGameServer };
-        PostToHost(HostEvent::NetMessage, 0, std::move(messageWrite).TakeBuffer());
-    }
+    SendSOCacheMessages(result.client, false);
+    SendSOCacheMessages(result.gameServer, true);
 
     if (result.notification.has_request())
     {
@@ -287,16 +394,25 @@ void ClientGC::BuildMatchmakingHello(CMsgGCCStrike15_v2_MatchmakingGC2ClientHell
     message.mutable_global_stats()->set_required_appid_version(13857);
     message.mutable_global_stats()->set_pricesheet_version(1680057676); // mikkotodo revisit
     message.mutable_global_stats()->set_twitch_streams_version(2);
+
+    // NOTE: on 2013 this is actually game_monthly_uniques!!! probably not read there so keep the event id
     message.mutable_global_stats()->set_active_tournament_eventid(20);
+
     message.mutable_global_stats()->set_active_survey_id(0);
     message.mutable_global_stats()->set_required_appid_version2(13862); // csgo s2
 
-    message.set_vac_banned(GetConfig().VacBanned());
-    message.mutable_commendation()->set_cmd_friendly(GetConfig().CommendedFriendly());
-    message.mutable_commendation()->set_cmd_teaching(GetConfig().CommendedTeaching());
-    message.mutable_commendation()->set_cmd_leader(GetConfig().CommendedLeader());
-    message.set_player_level(GetConfig().Level());
-    message.set_player_cur_xp(GetConfig().Xp());
+    message.set_vac_banned(GetConfig().m_vacBanned);
+
+    // set competitive rank and wins here for old builds
+    message.mutable_ranking()->set_account_id(AccountId());
+    message.mutable_ranking()->set_rank_id(GetConfig().m_competitiveRank);
+    message.mutable_ranking()->set_wins(GetConfig().m_competitiveWins);
+
+    message.mutable_commendation()->set_cmd_friendly(GetConfig().m_commendedFriendly);
+    message.mutable_commendation()->set_cmd_teaching(GetConfig().m_commendedTeaching);
+    message.mutable_commendation()->set_cmd_leader(GetConfig().m_commendedLeader);
+    message.set_player_level(GetConfig().m_level);
+    message.set_player_cur_xp(GetConfig().m_xp);
 }
 
 void ClientGC::BuildClientWelcome(CMsgClientWelcome &message, const CMsgCStrike15Welcome &csWelcome,
@@ -304,14 +420,14 @@ void ClientGC::BuildClientWelcome(CMsgClientWelcome &message, const CMsgCStrike1
 {
     message.set_version(0); // this is accurate
     message.set_game_data(csWelcome.SerializeAsString());
-    m_inventory.BuildCacheSubscription(*message.add_outofdate_subscribed_caches(), GetConfig().Level(), false);
+    m_inventory.BuildCacheSubscription(*message.add_outofdate_subscribed_caches(), GetConfig().m_level, false);
     message.mutable_location()->set_latitude(65.0133006f);
     message.mutable_location()->set_longitude(25.4646212f);
-    message.mutable_location()->set_country(GetConfig().Country());
+    message.mutable_location()->set_country(GetConfig().m_country);
     message.set_game_data2(matchmakingHello.SerializeAsString());
     message.set_rtime32_gc_welcome_timestamp(static_cast<uint32_t>(time(nullptr)));
-    message.set_currency(GetConfig().Currency());
-    message.set_txn_country_code(GetConfig().Country());
+    message.set_currency(GetConfig().m_currency);
+    message.set_txn_country_code(GetConfig().m_country);
 }
 
 void ClientGC::SendRankUpdate()
@@ -320,20 +436,20 @@ void ClientGC::SendRankUpdate()
 
     PlayerRankingInfo *rank = message.add_rankings();
     rank->set_account_id(AccountId());
-    rank->set_rank_id(GetConfig().CompetitiveRank());
-    rank->set_wins(GetConfig().CompetitiveWins());
+    rank->set_rank_id(GetConfig().m_competitiveRank);
+    rank->set_wins(GetConfig().m_competitiveWins);
     rank->set_rank_type_id(RankTypeCompetitive);
 
     rank = message.add_rankings();
     rank->set_account_id(AccountId());
-    rank->set_rank_id(GetConfig().WingmanRank());
-    rank->set_wins(GetConfig().WingmanWins());
+    rank->set_rank_id(GetConfig().m_wingmanRank);
+    rank->set_wins(GetConfig().m_wingmanWins);
     rank->set_rank_type_id(RankTypeWingman);
 
     rank = message.add_rankings();
     rank->set_account_id(AccountId());
-    rank->set_rank_id(GetConfig().DangerZoneRank());
-    rank->set_wins(GetConfig().DangerZoneWins());
+    rank->set_rank_id(GetConfig().m_dangerZoneRank);
+    rank->set_wins(GetConfig().m_dangerZoneWins);
     rank->set_rank_type_id(RankTypeDangerZone);
 
     SendMessageToGame(false, k_EMsgGCCStrike15_v2_ClientGCRankUpdate, message);
@@ -367,6 +483,24 @@ void ClientGC::OnClientHello(GCMessageRead &messageRead)
 
     // send all ranks here as well, it's a bit back and forth with real gc
     SendRankUpdate();
+}
+
+void ClientGC::OnMatchmakingHello()
+{
+    // only old builds explicitly request for this
+    CMsgGCCStrike15_v2_MatchmakingGC2ClientHello mmHello;
+    BuildMatchmakingHello(mmHello);
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello, mmHello);
+}
+
+void ClientGC::OnRequestInventoryRefresh()
+{
+    // only pre dota gcsdk merge builds send this
+    m_inventory.SetOldProtocol(true);
+
+    CMsgSOCacheSubscribed message;
+    m_inventory.BuildCacheSubscription(message, GetConfig().m_level, false);
+    SendMessageToGame(false, k_ESOMsg_CacheSubscribed, message);
 }
 
 void ClientGC::AdjustItemEquippedState(GCMessageRead &messageRead)
@@ -460,11 +594,31 @@ void ClientGC::SetItemPositions(GCMessageRead &messageRead)
 
     InventoryChangeMessages messages = m_inventory.SetItemPositions(message, acknowledgements);
 
-    for (const CMsgItemAcknowledged &acknowledgement : acknowledgements)
+    // send these to the server only
+    if (m_serverSteamId)
     {
-        // send these to the server only
-        GCMessageWrite messageWrite{ k_EMsgGCItemAcknowledged, acknowledgement };
-        PostToHost(HostEvent::NetMessage, 0, std::move(messageWrite).TakeBuffer());
+        for (const CMsgItemAcknowledged &acknowledgement : acknowledgements)
+        {
+            {
+                GCMessageWrite messageWrite{ k_EMsgGCItemAcknowledged, acknowledgement };
+                PostToHost(HostEvent::NetMessage, m_serverSteamId, std::move(messageWrite).TakeBuffer());
+            }
+
+            // support for older builds...
+            {
+                CMsgItemAcknowledged__DEPRECATED deprecated;
+                deprecated.set_account_id(acknowledgement.iteminfo().accountid());
+                deprecated.set_inventory(acknowledgement.iteminfo().inventory());
+                deprecated.set_def_index(acknowledgement.iteminfo().defindex());
+                deprecated.set_quality(acknowledgement.iteminfo().quality());
+                deprecated.set_rarity(acknowledgement.iteminfo().rarity());
+                deprecated.set_origin(acknowledgement.iteminfo().origin());
+                deprecated.set_item_id(acknowledgement.iteminfo().itemid());
+
+                GCMessageWrite messageWrite{ k_EMsgGCItemAcknowledged__DEPRECATED, deprecated };
+                PostToHost(HostEvent::NetMessage, m_serverSteamId, std::move(messageWrite).TakeBuffer());
+            }
+        }
     }
 
     SendInventoryChangeMessages(messages);
@@ -527,15 +681,17 @@ void ClientGC::StoreGetUserData(GCMessageRead &messageRead)
 
     std::string binaryString;
     binaryString.reserve(1 << 17);
-    priceSheet.BinaryWriteToString(binaryString);
+    priceSheetRead.Root().BinaryWriteToString(binaryString);
 
     // fuck you idiot
     CMsgStoreGetUserDataResponse response;
     response.set_result(1);
+    response.set_currency_deprecated(GetConfig().m_currency); // for old builds
+    response.set_country_deprecated(GetConfig().m_country); // for old builds
     response.set_price_sheet_version(1729); // what
     *response.mutable_price_sheet() = std::move(binaryString);
 
-    SendMessageToGame(false, k_EMsgGCStoreGetUserDataResponse, response);
+    SendMessageToGame(false, k_EMsgGCStoreGetUserDataResponse, response, messageRead.JobId());
 }
 
 void ClientGC::StorePurchaseInit(GCMessageRead &messageRead)
@@ -548,10 +704,8 @@ void ClientGC::StorePurchaseInit(GCMessageRead &messageRead)
     }
 
     // value doesn't matter
-    uint64_t transactionId = Random{}.Integer<uint64_t>();
-
     assert(!m_transactionId);
-    m_transactionId = transactionId;
+    m_transactionId = Random::Uint32(1, UINT32_MAX);
 
     std::vector<uint32_t> purchasedDefIndexes;
 
@@ -566,11 +720,11 @@ void ClientGC::StorePurchaseInit(GCMessageRead &messageRead)
     InventoryChangeMessages messages = m_inventory.PurchaseItems(purchasedDefIndexes, m_transactionItemIds);
 
     char url[128]; // url doesn't matter, but it needs to be set
-    snprintf(url, sizeof(url), "https://checkout.steampowered.com/checkout/approvetxn/%llu/?returnurl=steam", transactionId);
+    snprintf(url, sizeof(url), "https://checkout.steampowered.com/checkout/approvetxn/%llu/?returnurl=steam", m_transactionId);
 
     CMsgGCStorePurchaseInitResponse response;
     response.set_result(1); // success
-    response.set_txn_id(transactionId);
+    response.set_txn_id(m_transactionId);
     response.set_url(url);
     response.mutable_item_ids()->Assign(m_transactionItemIds.begin(), m_transactionItemIds.end());
 
@@ -602,6 +756,111 @@ void ClientGC::StorePurchaseFinalize(GCMessageRead &messageRead)
     m_transactionId = 0;
 }
 
+void ClientGC::StorePurchaseFinalizeStruct(GCMessageRead &messageRead)
+{
+    messageRead.ReadUint64();
+    if (!messageRead.IsValid())
+    {
+        Platform::Print("Parsing CMsgGCStorePurchaseFinalize (struct) failed, ignoring\n");
+        return;
+    }
+
+    assert(m_transactionId);
+
+    {
+        GCMessageWrite response{ k_EMsgGCStorePurchaseFinalizeResponse, messageRead.JobId() };
+
+        response.WriteUint16(1); // success
+        response.WriteUint32(static_cast<uint32_t>(m_transactionItemIds.size()));
+
+        for (uint64_t id : m_transactionItemIds)
+        {
+            response.WriteUint64(id);
+        }
+
+        uint32_t typeMasked = response.TypeMasked();
+        PostToHost(HostEvent::Message, typeMasked, std::move(response).TakeBuffer());
+    }
+
+    // done with this one
+    m_transactionId = 0;
+}
+
+void ClientGC::OnGetEventFavorites(GCMessageRead &messageRead)
+{
+    CMsgGCCStrike15_v2_GetEventFavorites_Request request;
+    if (!messageRead.ReadProtobuf(request))
+    {
+        Platform::Print("Parsing GetEventFavorites failed, ignoring\n");
+        return;
+    }
+
+    CMsgGCCStrike15_v2_GetEventFavorites_Response response;
+    response.set_all_events(request.all_events());
+    response.set_json_favorites("[]");
+    response.set_json_featured("[]");
+
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_GetEventFavorites_Response, response);
+}
+
+void ClientGC::OnPartyRegister(GCMessageRead &messageRead)
+{
+    CMsgGCCStrike15_v2_Party_Register message;
+    if (!messageRead.ReadProtobuf(message))
+    {
+        Platform::Print("Failed to parse Party_Register\n");
+        return;
+    }
+
+    uint32_t lobbyId = message.id();
+    if (!lobbyId)
+    {
+        lobbyId = Random::Uint32(1, UINT32_MAX);
+    }
+
+    CMsgGCCStrike15_v2_Party_Register response;
+    response.set_id(lobbyId);
+    response.set_ver(message.ver());
+    response.set_apr(1);
+    response.set_ark(static_cast<uint32_t>(GetConfig().m_competitiveRank) * 10);
+    response.set_grp(3);
+    response.set_slots(5);
+    response.set_launcher(message.launcher());
+    response.set_game_type(message.game_type());
+
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_Party_Register, response);
+}
+
+void ClientGC::CraftItem(GCMessageRead &messageRead)
+{
+    /*uint16_t recipeDefIndex =*/messageRead.ReadUint16();
+    uint16_t itemIdCount = messageRead.ReadUint16();
+    const void *itemIdsPtr = messageRead.ReadData(itemIdCount * sizeof(uint64_t));
+    if (!messageRead.IsValid())
+    {
+        Platform::Print("Parsing CMsgGCCraft failed, ignoring\n");
+        return;
+    }
+
+    auto itemIds = std::make_unique_for_overwrite<uint64_t[]>(itemIdCount);
+    memcpy(itemIds.get(), itemIdsPtr, itemIdCount * sizeof(uint64_t));
+
+    uint64_t outputItemId;
+    InventoryChangeMessages messages = m_inventory.CraftItem({ itemIds.get(), itemIdCount }, outputItemId);
+    SendInventoryChangeMessages(messages);
+
+    {
+        GCMessageWrite craftResponse{ k_EMsgGCCraftResponse };
+        craftResponse.WriteUint32(0); // wtf
+        craftResponse.WriteUint16(0); // wtf
+        craftResponse.WriteUint16(1); // item count
+        craftResponse.WriteUint64(outputItemId);
+
+        uint32_t typeMasked = craftResponse.TypeMasked();
+        PostToHost(HostEvent::Message, typeMasked, std::move(craftResponse).TakeBuffer());
+    }
+}
+
 void ClientGC::DeleteItem(GCMessageRead &messageRead)
 {
     // there is data after this, but i don't know what it is
@@ -630,6 +889,13 @@ void ClientGC::UnlockCrate(GCMessageRead &messageRead)
 
     InventoryChangeMessages messages = m_inventory.UnlockCrate(crateId, keyId);
     SendInventoryChangeMessages(messages);
+
+    // send this for old builds
+    // FIXME: payload contents? don't think game reads it so we
+    // can just pass an empty protobuf though... should probably
+    // have a more idiomatic way of sending empty messages
+    CMsgRequestInventoryRefresh response;
+    SendMessageToGame(false, k_EMsgGCUnlockCrateResponse, response);
 }
 
 void ClientGC::NameItem(GCMessageRead &messageRead)
@@ -1013,6 +1279,7 @@ const char *MessageName(uint32_t type)
         HANDLE_MSG(k_ESOMsg_CacheSubscriptionRefresh);
     }
 
-    assert(false);
-    return "UNKNOWN MESSAGE";
+    static thread_local char buffer[16];
+    snprintf(buffer, sizeof(buffer), "%u", type);
+    return buffer;
 }

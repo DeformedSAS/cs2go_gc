@@ -1,31 +1,39 @@
 #include "stdafx.h"
 #include "config.h"
 #include "keyvalue.h"
-#include "random.h"
 
 constexpr const char *ConfigFilePath = "cs2go/gc/config.txt";
 
-const GCConfig &GetConfig()
+static GCConfig s_config;
+
+void LoadConfig()
 {
-    static GCConfig instance;
-    return instance;
+    s_config.Load();
 }
 
-GCConfig::GCConfig()
+const GCConfig &GetConfig()
 {
-    KeyValue config{ "config" };
+    return s_config;
+}
 
-    if (!config.ParseFromFile(ConfigFilePath))
+void GCConfig::Load()
+{
+    KeyValueRead configRead{ ConfigFilePath };
+    if (!configRead.Good())
     {
         return;
     }
+
+    const KeyValue &config = configRead.Root();
 
     m_logOutput = config.GetNumber("log_output", m_logOutput);
 
     m_appIdOverride = config.GetNumber("appid_override", m_appIdOverride);
     m_showCsgoGCServersOnly = config.GetNumber("show_csgo_gc_servers_only", m_showCsgoGCServersOnly);
 
-    m_inventoryEditorOrigin = config.GetString("inventory_editor_origin");
+    m_itemSchemaPath = config.GetString("item_schema_path", m_itemSchemaPath);
+
+    m_inventoryEditorOrigin = config.GetString("inventory_editor_origin", m_inventoryEditorOrigin);
 
     const KeyValue *ranks = config.GetSubkey("ranks");
     if (ranks)
@@ -46,9 +54,9 @@ GCConfig::GCConfig()
     if (rarityWeights)
     {
         m_rarityWeights.clear();
-        m_rarityWeights.reserve(rarityWeights->SubkeyCount());
+        m_rarityWeights.reserve(rarityWeights->Subkeys().size());
 
-        for (const KeyValue &subkey : *rarityWeights)
+        for (const KeyValue &subkey : rarityWeights->Subkeys())
         {
             RarityWeight weight;
             weight.rarity = ToEnum<Rarity>(FromString<uint32_t>(subkey.Name()));

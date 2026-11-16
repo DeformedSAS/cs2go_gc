@@ -6,8 +6,8 @@
 #include "base_gcmessages.pb.h"
 #include "cstrike15_gcmessages.pb.h"
 
-Item::Item(uint32_t highId, uint32_t accountId, const KeyValue &kv, const ItemSchema &itemSchema)
-    : m_highId{ highId }
+Item::Item(uint32_t lowId, uint32_t accountId, const KeyValue &kv, const ItemSchema &itemSchema)
+    : m_lowId{ lowId }
 {
     m_desc.inventory = kv.GetNumber<uint32_t>("inventory");
     m_desc.defIndex = ToEnum<ItemDefIndex>(kv.GetNumber<uint32_t>("def_index"));
@@ -21,18 +21,24 @@ Item::Item(uint32_t highId, uint32_t accountId, const KeyValue &kv, const ItemSc
     const KeyValue *attributesKey = kv.GetSubkey("attributes");
     if (attributesKey)
     {
-        m_desc.attributes.reserve(attributesKey->SubkeyCount());
+        m_desc.attributes.reserve(attributesKey->Subkeys().size());
 
-        for (const KeyValue &attributeKey : *attributesKey)
+        for (const KeyValue &attributeKey : attributesKey->Subkeys())
         {
             AttributeDefIndex defIndex = ToEnum<AttributeDefIndex>(FromString<uint32_t>(attributeKey.Name()));
             std::string_view value = attributeKey.String();
 
-            // fix up stored item ids so loading an inventory file saved
-            // on another steam account doesn't fuck things up
+            // we have switched around the low and high parts of the item ids,
+            // so remap here to avoid breaking existing inventory files...
+            // we also save these to inventory.txt the wrong way around
             if (defIndex == AttributeDefIndex::CasketIdLow)
             {
-                m_desc.attributes.emplace_back(defIndex, accountId);
+                m_desc.attributes.emplace_back(AttributeDefIndex::CasketIdHigh, HighItemIdFromAccountId(accountId));
+                continue;
+            }
+            else if (defIndex == AttributeDefIndex::CasketIdHigh)
+            {
+                m_desc.attributes.emplace_back(AttributeDefIndex::CasketIdLow, FromString<uint32_t>(value));
                 continue;
             }
 
@@ -66,25 +72,39 @@ Item::Item(uint32_t highId, uint32_t accountId, const KeyValue &kv, const ItemSc
     const KeyValue *equippedStateKey = kv.GetSubkey("equipped_state");
     if (equippedStateKey)
     {
-        m_desc.equips.reserve(equippedStateKey->SubkeyCount());
+        m_desc.equips.reserve(equippedStateKey->Subkeys().size());
 
-        for (const KeyValue &equippedKey : *equippedStateKey)
+        for (const KeyValue &equippedKey : equippedStateKey->Subkeys())
         {
             uint32_t equipClass = FromString<uint32_t>(equippedKey.Name());
             uint32_t equpSlot = FromString<uint32_t>(equippedKey.String());
             m_desc.equips.emplace_back(equipClass, equpSlot);
         }
     }
+
+    // stupid hack to fix saved item qualities, unique is correct for any gc generated item
+    if (m_desc.quality == Quality::Normal)
+    {
+        m_desc.quality = Quality::Unique;
+    }
 }
 
-Item::Item(uint32_t highId, ItemDesc &&desc)
-    : m_highId{ highId }
+Item::Item(uint32_t lowId, ItemDesc &&desc)
+    : m_lowId{ lowId }
     , m_desc{ std::move(desc) }
 {
+    // i guess we do this here as well for now...
+    if (m_desc.quality == Quality::Normal)
+    {
+        m_desc.quality = Quality::Unique;
+    }
 }
 
-void Item::ToKeyValue(KeyValue &kv) const
+void Item::ToKeyValue(KeyValueWrite &kv) const
 {
+    // schizo check, these should not be generated normally
+    assert(m_desc.quality != Quality::Normal);
+
     kv.AddNumber("inventory", m_desc.inventory);
     kv.AddNumber("def_index", FromEnum(m_desc.defIndex));
     kv.AddNumber("level", m_desc.level);
@@ -94,50 +114,97 @@ void Item::ToKeyValue(KeyValue &kv) const
     kv.AddNumber("in_use", m_desc.inUse);
     kv.AddNumber("rarity", FromEnum(m_desc.rarity));
 
-    KeyValue &attributesKey = kv.AddSubkey("attributes");
-    for (const ItemAttribute &attribute : m_desc.attributes)
+    if (!m_desc.attributes.empty())
     {
-        std::string name = std::to_string(FromEnum(attribute.DefIndex()));
+        kv.BeginBlock("attributes");
 
-        // illegible bullshit
-        std::string value = std::visit(Bruh{
-                                           [&](float v)
-                                           { return std::to_string(v); },
-                                           [&](uint32_t v)
-                                           { return std::to_string(v); },
-                                           [&](const std::string &v)
-                                           { return v; },
-                                       },
-            attribute.Value());
+        for (const ItemAttribute &attribute : m_desc.attributes)
+        {
+            AttributeDefIndex diskDefIndex = attribute.DefIndex();
 
-        attributesKey.AddString(name, value);
+            // switch low and high ids, see the constructor
+            if (diskDefIndex == AttributeDefIndex::CasketIdLow)
+            {
+                diskDefIndex = AttributeDefIndex::CasketIdHigh;
+            }
+            else if (diskDefIndex == AttributeDefIndex::CasketIdHigh)
+            {
+                diskDefIndex = AttributeDefIndex::CasketIdLow;
+            }
+
+            std::string name = std::to_string(FromEnum(diskDefIndex));
+
+            // illegible bullshit
+            std::string value = std::visit(Bruh{
+                                               [&](float v)
+                                               { return std::to_string(v); },
+                                               [&](uint32_t v)
+                                               { return std::to_string(v); },
+                                               [&](const std::string &v)
+                                               { return v; },
+                                           },
+                attribute.Value());
+
+            kv.AddString(name, value);
+        }
+
+        kv.EndBlock();
     }
 
-    KeyValue &equippedStateKey = kv.AddSubkey("equipped_state");
-    for (const ItemEquip &equip : m_desc.equips)
+    if (!m_desc.equips.empty())
     {
-        equippedStateKey.AddNumber(std::to_string(equip.Class()), equip.Slot());
+        kv.BeginBlock("equipped_state");
+
+        for (const ItemEquip &equip : m_desc.equips)
+        {
+            kv.AddNumber(std::to_string(equip.Class()), equip.Slot());
+        }
+
+        kv.EndBlock();
     }
 }
 
-static void SetAttributeFloat(CSOEconItemAttribute *attribute, float value)
+static void SetAttributeFloat(CSOEconItemAttribute *attribute, float value, bool oldProtocol)
 {
-    attribute->set_value_bytes(&value, sizeof(value));
+    if (oldProtocol)
+    {
+        attribute->set_value(std::bit_cast<uint32_t>(value));
+    }
+    else
+    {
+        attribute->set_value_bytes(&value, sizeof(value));
+    }
 }
 
-static void SetAttributeUint32(CSOEconItemAttribute *attribute, uint32_t value)
+static void SetAttributeUint32(CSOEconItemAttribute *attribute, uint32_t value, bool oldProtocol)
 {
-    attribute->set_value_bytes(&value, sizeof(value));
+    if (oldProtocol)
+    {
+        attribute->set_value(value);
+    }
+    else
+    {
+        attribute->set_value_bytes(&value, sizeof(value));
+    }
 }
 
-static void SetAttributeString(CSOEconItemAttribute *attribute, std::string_view value)
+static void SetAttributeString(CSOEconItemAttribute *attribute, std::string_view value, bool oldProtocol)
 {
-    CAttribute_String string;
-    string.set_value(value);
-    string.SerializeToString(attribute->mutable_value_bytes());
+    if (oldProtocol)
+    {
+        // shouldn't be possible to reach
+        // if this is reached, ignoring the attribute is fine
+        assert(false);
+    }
+    else
+    {
+        CAttribute_String string;
+        string.set_value(value);
+        string.SerializeToString(attribute->mutable_value_bytes());
+    }
 }
 
-void Item::ToCSOEconItem(CSOEconItem &item, uint32_t accountId) const
+void Item::ToCSOEconItem(CSOEconItem &item, uint32_t accountId, const ItemSchema &itemSchema, bool oldProtocol) const
 {
     item.set_id(FullIdFor(accountId));
     item.set_account_id(accountId);
@@ -153,20 +220,59 @@ void Item::ToCSOEconItem(CSOEconItem &item, uint32_t accountId) const
 
     for (const ItemAttribute &attribute : m_desc.attributes)
     {
+        if (oldProtocol
+            && attribute.DefIndex() == AttributeDefIndex::CustomName
+            && std::holds_alternative<std::string>(attribute.Value()))
+        {
+            // no string attributes, need to set the item field
+            item.set_custom_name(std::get<std::string>(attribute.Value()));
+            continue;
+        }
+
         CSOEconItemAttribute *econ = item.add_attribute();
         econ->set_def_index(FromEnum(attribute.DefIndex()));
 
         // illegible bullshit
         std::visit(Bruh{
                        [&](float v)
-                       { SetAttributeFloat(econ, v); },
+                       { SetAttributeFloat(econ, v, oldProtocol); },
                        [&](uint32_t v)
-                       { SetAttributeUint32(econ, v); },
+                       { SetAttributeUint32(econ, v, oldProtocol); },
                        [&](const std::string &v)
-                       { SetAttributeString(econ, v); },
+                       { SetAttributeString(econ, v, oldProtocol); },
                    },
             attribute.Value());
     }
+
+    // stupid hack: old builds can't read this from the static attribute
+    // FIXME: correct way would be force_gc_to_generate
+    if (oldProtocol && !HasAttribute(AttributeDefIndex::SupplyCrateSeries))
+    {
+        uint32_t supplyCrateSeries = itemSchema.GetCrateSupplyCrateSeries(m_desc.defIndex);
+        if (supplyCrateSeries)
+        {
+            CSOEconItemAttribute *econ = item.add_attribute();
+            econ->set_def_index(FromEnum(AttributeDefIndex::SupplyCrateSeries));
+
+            switch (itemSchema.GetAttributeType(AttributeDefIndex::SupplyCrateSeries))
+            {
+            case AttributeType::Float:
+                SetAttributeFloat(econ, static_cast<float>(supplyCrateSeries), oldProtocol);
+                break;
+
+            case AttributeType::Uint32:
+                SetAttributeUint32(econ, supplyCrateSeries, oldProtocol);
+                break;
+
+            default:
+                assert(false);
+                break;
+            }
+        }
+    }
+
+    // for old builds
+    item.set_contains_equipped_state(!m_desc.equips.empty());
 
     for (const ItemEquip &equip : m_desc.equips)
     {
@@ -357,6 +463,10 @@ void Item::ToEconItemPreviewDataBlock(CEconItemPreviewDataBlock &block, uint32_t
 
         case AttributeDefIndex::StickerRotation5:
             stickers[5].set_rotation(attribute.ValueAs<float>());
+            break;
+
+        default:
+            // does not affect the preview block
             break;
         }
     }

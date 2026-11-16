@@ -2,19 +2,11 @@
 
 #include "item.h"
 
-class Inventory;
-
 enum class ItemChangeType
 {
     Created,
     Updated,
     Destroyed
-};
-
-struct ItemChange
-{
-    ItemChangeType type;
-    bool gameServerDirty;
 };
 
 enum class AttributeIncrement
@@ -26,21 +18,22 @@ enum class AttributeIncrement
 
 // record changes made to the inventory so we can build the correct
 // messages for the game to update its shared object cache
-class InventoryModify
+class InventoryModify : public NonCopyable
 {
 public:
-    InventoryModify(Inventory &inventory);
-    ~InventoryModify();
+    ~InventoryModify()
+    {
+        assert(m_finished || !HasChanges());
+    }
 
-    InventoryModify(const InventoryModify &) = delete;
-    InventoryModify(InventoryModify &&) = delete;
-
-    InventoryModify &operator=(const InventoryModify &) = delete;
-    InventoryModify &operator=(InventoryModify &&) = delete;
+    bool HasChanges() const
+    {
+        return !m_itemChanges.empty() || !m_defaultEquipChanges.empty();
+    }
 
     // manual bookkeeping
-    void MarkItemCreated(uint32_t highId, bool gameServerDirty);
-    void MarkItemDestroyed(uint32_t highId, bool gameServerDirty);
+    void MarkItemCreated(uint32_t lowId);
+    void MarkItemDestroyed(uint32_t lowId);
     void MarkDefaultEquipChanged(const DefaultEquip &defaultEquip);
 
     // full update from the editor, except for equips as those need manual handling
@@ -58,13 +51,14 @@ public:
 
     void AddItemEquip(Item &item, uint32_t classId, uint32_t slotId);
     void RemoveItemEquips(Item &item);
-    bool RemoveItemEquip(Item &item, uint32_t classId, uint32_t slotId);
+    void RemoveItemEquip(Item &item, uint32_t classId, uint32_t slotId);
 
-    std::unordered_map<uint32_t, ItemChange> m_itemChanges;
+    // schizo debug
+    bool m_finished{ false };
+
+    std::unordered_map<uint32_t, ItemChangeType> m_itemChanges;
     std::vector<DefaultEquip> m_defaultEquipChanges;
 
 private:
-    void MarkUpdatedInternal(uint32_t highId, bool gameServerDirty);
-
-    Inventory &m_inventory;
+    void MarkUpdatedInternal(uint32_t lowId);
 };

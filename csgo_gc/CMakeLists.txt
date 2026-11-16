@@ -40,7 +40,16 @@ add_library(csgo_gc STATIC
     message.cpp
     networking_client.cpp
     networking_server.cpp
-    steam_hook.cpp)
+    random.cpp
+    steam_callbacks.cpp
+    steam_hook.cpp
+    steamgamecoordinatorproxy.cpp
+    steamgameserverproxy.cpp
+    steammatchmakingserversproxy.cpp
+    steampipecontext.cpp
+    steamuserproxy.cpp
+    steamuserstatsproxy.cpp
+    steamutilsproxy.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_sources(csgo_gc PRIVATE platform_windows.cpp)
@@ -88,3 +97,7 @@ if (APPLE)
     target_link_libraries(csgo_gc PRIVATE "-framework Foundation")
 endif()
 
+# libwebsockets kludge
+if(WIN32)
+    target_link_libraries(csgo_gc PRIVATE synchronization)
+endif()

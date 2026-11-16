@@ -1,12 +1,28 @@
 #pragma once
 
 #include "item_schema_const.h"
+#include "gc_const_csgo.h"
 
 class ItemSchema;
 class KeyValue;
+class KeyValueWrite;
 
 class CSOEconItem;
 class CEconItemPreviewDataBlock;
+
+// need to rape the account id so the resulting item id won't be treated as a default item
+// this is quite schizophrenic, at least at the time of writing this it shouldn't modify any ids
+constexpr uint32_t HighItemIdFromAccountId(uint32_t accountId)
+{
+    constexpr uint32_t mask = static_cast<uint32_t>(ItemIdDefaultItemMask >> 32);
+    return (accountId & mask) == mask ? (accountId & ~mask) : accountId;
+}
+
+// mix the account id into item ids to avoid collisions in multiplayer games
+constexpr uint64_t ComposeItemId(uint32_t accountId, uint32_t lowId)
+{
+    return (static_cast<uint64_t>(HighItemIdFromAccountId(accountId)) << 32) | lowId;
+}
 
 // not item related per se, but where else would this go...
 struct DefaultEquip
@@ -23,7 +39,7 @@ class ItemAttribute
 public:
     ItemAttribute(AttributeDefIndex defIndex, ItemAttributeValue value)
         : m_defIndex{ defIndex }
-        , m_value{ value }
+        , m_value{ std::move(value) }
     {
     }
 
@@ -87,25 +103,23 @@ class Item
 {
 public:
     // used on init
-    Item(uint32_t highId, uint32_t accountId, const KeyValue &kv, const ItemSchema &itemSchema);
+    Item(uint32_t lowId, uint32_t accountId, const KeyValue &kv, const ItemSchema &itemSchema);
 
     // used by InventoryModify to create items
-    Item(uint32_t highId, ItemDesc &&desc);
+    Item(uint32_t lowId, ItemDesc &&desc);
 
     // stupid
     uint64_t FullIdFor(uint32_t accountId) const
     {
-        uint64_t low = accountId;
-        uint64_t high = m_highId;
-        return low | (high << 32);
+        return ComposeItemId(accountId, m_lowId);
     }
 
     // serialization...
-    void ToKeyValue(KeyValue &kv) const;
-    void ToCSOEconItem(CSOEconItem &item, uint32_t accountId) const;
+    void ToKeyValue(KeyValueWrite &kv) const;
+    void ToCSOEconItem(CSOEconItem &item, uint32_t accountId, const ItemSchema &itemSchema, bool oldProtocol) const;
     void ToEconItemPreviewDataBlock(CEconItemPreviewDataBlock &block, uint32_t accountId) const;
 
-    uint32_t HighId() const { return m_highId; }
+    uint32_t LowId() const { return m_lowId; }
     const ItemDesc &GetDesc() const { return m_desc; }
 
     // FIXME: cull some of the stuff below in favour of using GetDesc???
@@ -135,7 +149,6 @@ public:
         {
             if (attribute.DefIndex() == defIndex)
             {
-
                 return attribute.ValueAs<T>();
             }
         }
@@ -146,6 +159,6 @@ public:
 private:
     friend class InventoryModify;
 
-    const uint32_t m_highId;
+    const uint32_t m_lowId;
     ItemDesc m_desc{};
 };

@@ -4,7 +4,6 @@
 #include "inventory_editor.h"
 #include "item.h"
 #include "item_schema.h"
-#include "random.h"
 
 class CMsgApplySticker;
 class CMsgSetItemPositions;
@@ -18,12 +17,22 @@ enum EGCItemCustomizationNotification : int;
 
 class InventoryModify;
 struct InventoryChangeMessages;
+struct SOCacheMessages;
+
+struct SOCacheState
+{
+    bool subscribed{};
+    std::unordered_set<uint64_t> items;
+};
 
 class Inventory
 {
 public:
     Inventory(uint64_t steamId);
     ~Inventory();
+
+    // called on client welcome
+    void SetOldProtocol(bool oldProtocol) { m_oldProtocol = oldProtocol; }
 
     bool Update(InventoryChangeMessages &changeMessages);
 
@@ -41,27 +50,39 @@ public:
     InventoryChangeMessages RemoveItemName(uint64_t itemId);
     InventoryChangeMessages CasketItemAdd(uint64_t casketId, uint64_t itemId);
     InventoryChangeMessages CasketItemExtract(uint64_t casketId, uint64_t itemId);
+    InventoryChangeMessages CraftItem(std::span<const uint64_t> inputItemIds, uint64_t &outputItemId);
 
     InventoryChangeMessages SetItemPositions(const CMsgSetItemPositions &message, std::vector<CMsgItemAcknowledged> &acknowledgements);
     InventoryChangeMessages PurchaseItems(const std::vector<uint32_t> &defIndexes, std::vector<uint64_t> &itemIds);
 
-    // called by InventoryModify when it goes out of scope
-    void FlushChanges(const InventoryModify &modify);
+    // FIXME: unfuck this!!!
+    void ResetGameServerCache()
+    {
+        m_gameServerCache.subscribed = false;
+        m_gameServerCache.items.clear();
+    }
 
 private:
     uint32_t AccountId() const;
 
-    InventoryChangeMessages BuildChangeMessages(
-        const InventoryModify &modify,
+    // increment version, build messages for the game, send changes to editor and write to file
+    InventoryChangeMessages FinishChanges(
+        InventoryModify &modify,
         std::optional<EGCItemCustomizationNotification> customizationType = std::nullopt,
         std::initializer_list<uint64_t> customizationItemIds = {});
 
-    // allocates an unique high item id
-    // pass zero as highItemId if you don't want a specific one
-    uint32_t GetHighItemId(uint32_t highItemId);
+    void BuildSOCacheMessages(
+        const InventoryModify &modify,
+        SOCacheState &state,
+        SOCacheMessages &messages,
+        bool server);
+
+    // allocates an unique low item id
+    // pass zero as lowItemId if you don't want a specific one
+    uint32_t GetLowItemId(uint32_t lowItemId);
 
     // used to create items from inventory.txt
-    void CreateItem(uint32_t highId, const KeyValue &kv);
+    void CreateItem(uint32_t lowId, const KeyValue &kv);
 
     // used to create items at runtime
     Item &CreateItem(InventoryModify &modify, ItemDesc &&desc);
@@ -86,17 +107,23 @@ private:
     void SendFullInventoryToEditor();
     void SendChangesToEditor(const InventoryModify &modify);
 
-    void RemoveCachedIcon(uint32_t highId) const;
+    void RemoveCachedIcon(uint32_t lowId);
 
     const uint64_t m_steamId;
     ItemSchema m_itemSchema;
-    Random m_random;
-    uint32_t m_lastHighItemId{};
+    bool m_oldProtocol{ false };
+    uint32_t m_lastLowItemId{};
+    uint64_t m_version{ 1 };
     std::unordered_map<uint64_t, Item> m_items;
     std::vector<DefaultEquip> m_defaultEquips;
+
+    SOCacheState m_clientCache;
+    SOCacheState m_gameServerCache;
 
     InventoryEditor m_editor;
 
     // stupid hack since we don't want to show casketed items in the editor
     std::unordered_set<uint32_t> m_editorVisibleItems;
+
+    int m_iconCacheVersion{ -1 };
 };

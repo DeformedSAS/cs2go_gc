@@ -5,15 +5,21 @@
 #include "item_schema.h"
 #include "random.h"
 
-CaseOpening::CaseOpening(const ItemSchema &itemSchema, Random &random)
+struct RarityGroup
+{
+    std::span<const LootListItem *const> items;
+    float weight;
+};
+
+CaseOpening::CaseOpening(const ItemSchema &itemSchema)
     : m_itemSchema{ itemSchema }
-    , m_random{ random }
 {
 }
 
 // returns true if there are unusuals (stattrak able)
 static bool GetLootListItems(const LootList &lootList, std::vector<const LootListItem *> &items)
 {
+    assert(!lootList.allEntriesAsAdditionalDrops);
     bool unusuals = lootList.isUnusual;
 
     for (const LootList *other : lootList.subLists)
@@ -29,9 +35,10 @@ static bool GetLootListItems(const LootList &lootList, std::vector<const LootLis
     return unusuals;
 }
 
-static bool CompareRarity(const LootListItem *a, const LootListItem *b) { return a->CaseRarity() < b->CaseRarity(); }
-static bool RarityLower(const LootListItem *a, Rarity b) { return a->CaseRarity() < b; }
-static bool RarityUpper(Rarity a, const LootListItem *b) { return a < b->CaseRarity(); }
+static bool CompareRarity(const LootListItem *a, const LootListItem *b)
+{
+    return a->CaseRarity() < b->CaseRarity();
+}
 
 bool CaseOpening::SelectItemFromCrate(ItemDefIndex crateDefIndex, ItemDesc &desc)
 {
@@ -42,18 +49,56 @@ bool CaseOpening::SelectItemFromCrate(ItemDefIndex crateDefIndex, ItemDesc &desc
         return false;
     }
 
-    assert(lootList->subLists.empty() != lootList->items.empty());
-
-    std::vector<const LootListItem *> lootListItems;
-    lootListItems.reserve(32); // overkill
-    bool containsUnusuals = GetLootListItems(*lootList, lootListItems);
-    if (!lootListItems.size())
+    std::vector<ItemDesc> rewards;
+    if (!SelectItemsFromLootList(*lootList, false, ItemOriginCrate, UnacknowledgedFoundInCrate, rewards))
     {
-        assert(false);
         return false;
     }
 
-    // must be sorted for SelectLootListItem and friends
+    assert(rewards.size() == 1);
+    desc = std::move(rewards.front());
+    return true;
+}
+
+bool CaseOpening::SelectItemsFromLootList(
+    const LootList &lootList,
+    bool forceStatTrak,
+    ItemOrigin origin,
+    UnacknowledgedType unacknowledgedType,
+    std::vector<ItemDesc> &descs)
+{
+    assert(!lootList.items.empty() || !lootList.subLists.empty());
+    forceStatTrak |= lootList.willProduceStatTrak;
+
+    if (lootList.allEntriesAsAdditionalDrops)
+    {
+        for (const LootList *other : lootList.subLists)
+        {
+            if (!SelectItemsFromLootList(*other, forceStatTrak, origin, unacknowledgedType, descs))
+            {
+                return false;
+            }
+        }
+
+        for (const LootListItem &item : lootList.items)
+        {
+            ItemDesc desc{};
+            if (!m_itemSchema.ItemDescForLootListItem(item, forceStatTrak, origin, unacknowledgedType, desc))
+            {
+                return false;
+            }
+
+            descs.push_back(std::move(desc));
+        }
+
+        return true;
+    }
+
+    std::vector<const LootListItem *> lootListItems;
+    lootListItems.reserve(32); // overkill
+    bool containsUnusuals = GetLootListItems(lootList, lootListItems);
+
+    // must be sorted for SelectLootListItem
     std::sort(lootListItems.begin(), lootListItems.end(), CompareRarity);
 
     const LootListItem *lootListItem = SelectLootListItem(lootListItems);
@@ -63,81 +108,63 @@ bool CaseOpening::SelectItemFromCrate(ItemDefIndex crateDefIndex, ItemDesc &desc
         return false;
     }
 
-    bool statTrak = ShouldMakeStatTrak(*lootListItem, *lootList, containsUnusuals);
-    return m_itemSchema.ItemDescForLootListItem(m_random, *lootListItem, statTrak, ItemOriginCrate, UnacknowledgedFoundInCrate, desc);
-}
+    bool statTrak = forceStatTrak || ShouldMakeStatTrak(*lootListItem, lootList, containsUnusuals);
 
-// get a range of loot list items with a specific rarity from a vector sorted by rarity
-static std::pair<size_t, size_t> FindRarityRange(const std::vector<const LootListItem *> &items, Rarity rarity)
-{
-    // MUST have items and they MUST be sorted
-    assert(items.size() && std::is_sorted(items.begin(), items.end(), CompareRarity));
-
-    auto lower = std::lower_bound(items.begin(), items.end(), rarity, RarityLower);
-    auto upper = std::upper_bound(lower, items.end(), rarity, RarityUpper);
-
-    size_t begin = std::distance(items.begin(), lower);
-    size_t end = std::distance(items.begin(), upper);
-
-    return std::make_pair(begin, end);
-}
-
-const LootListItem *CaseOpening::SelectLootListItem(const std::vector<const LootListItem *> &items)
-{
-    Rarity rarity = RandomRarityForItems(items);
-
-    auto [begin, end] = FindRarityRange(items, rarity);
-    if (begin == end)
+    ItemDesc desc{};
+    if (!m_itemSchema.ItemDescForLootListItem(*lootListItem, statTrak, origin, unacknowledgedType, desc))
     {
-        assert(false);
-        return nullptr;
+        return false;
     }
 
-    size_t index = m_random.Integer(begin, end - 1);
-    return items[index];
+    descs.push_back(std::move(desc));
+    return true;
 }
 
-Rarity CaseOpening::RandomRarityForItems(const std::vector<const LootListItem *> &items)
+const LootListItem *CaseOpening::SelectLootListItem(std::span<const LootListItem *const> sortedItems)
 {
-    // MUST have items and they MUST be sorted
-    assert(items.size() && std::is_sorted(items.begin(), items.end(), CompareRarity));
+    if (sortedItems.size() == 1)
+    {
+        return sortedItems.front();
+    }
 
-    std::vector<RarityWeight> weights;
-    weights.reserve(items.size()); // overkill
+    std::vector<RarityGroup> groups;
+    groups.reserve(sortedItems.size()); // overkill
 
     float totalWeight = 0;
 
-    // items are sorted by rarity, so iterate through the available rarities like this
-    for (size_t i = 0; i < items.size(); i++)
+    // group consecutive items of the same rarity
+    for (auto first = sortedItems.begin(); first != sortedItems.end();)
     {
-        Rarity rarity = items[i]->CaseRarity();
-        float weight = GetConfig().GetRarityWeight(rarity);
+        Rarity rarity = (*first)->CaseRarity();
 
-        weights.push_back({ rarity, weight });
+        auto last = first + 1;
+        while (last != sortedItems.end() && (*last)->CaseRarity() == rarity)
+        {
+            last++;
+        }
+
+        float weight = GetConfig().GetRarityWeight(rarity);
+        groups.push_back({ { first, last }, weight });
         totalWeight += weight;
 
-        // skip over any duplicate rarities
-        while (i + 1 < items.size() && items[i]->CaseRarity() == items[i + 1]->CaseRarity())
-        {
-            i++;
-        }
+        first = last;
     }
 
     // play the game of chance...
-    float value = m_random.Float(0.0f, totalWeight);
+    float value = Random::Float(0.0f, totalWeight);
     float accum = 0.0f;
 
-    for (const RarityWeight &pair : weights)
+    for (const RarityGroup &group : groups)
     {
-        accum += pair.weight;
+        accum += group.weight;
         if (value < accum)
         {
-            return pair.rarity;
+            return Random::Select(group.items);
         }
     }
 
     assert(false);
-    return Rarity::Default;
+    return nullptr;
 }
 
 bool CaseOpening::ShouldMakeStatTrak(const LootListItem &item, const LootList &lootList, bool containsUnusuals)
@@ -156,11 +183,11 @@ bool CaseOpening::ShouldMakeStatTrak(const LootListItem &item, const LootList &l
 
     // unusual stattraks only valid below id 1000
     if (item.quality == Quality::Unusual
-        && item.itemInfo->m_defIndex >= ToEnum<ItemDefIndex>(1000u))
+        && item.itemDefIndex >= ToEnum<ItemDefIndex>(1000u))
     {
         return false;
     }
 
     // roll the dice
-    return (m_random.Integer(1, 10) == 1);
+    return (Random::Uint32(1, 10) == 1);
 }

@@ -45,11 +45,19 @@ if (MSVC)
     # statically linked crt
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_options(/MP)
+
+    # disable exceptions to avoid coroutine related crashes in old builds
+    string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    add_compile_definitions(_HAS_EXCEPTIONS=0)
 else()
     add_compile_options(-fpic -fvisibility=hidden)
 
     if (NOT APPLE)
         add_link_options(-Wl,--no-undefined -z noexecstack)
+    endif()
+
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_link_options(-static-libstdc++ -static-libgcc)
     endif()
 endif()
 
